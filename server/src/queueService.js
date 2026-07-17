@@ -10,12 +10,16 @@
 const db = require("./db");
 const log = require("./log");
 const maxcheapai = require("./maxcheapai");
+const cfgSvc = require("./configService");
 const { validateVideoPayload } = require("./videoValidate");
 
 const POLL_MS = 15000;          // 10–20s window; poll every 15s
 const MAX_RETRIES = 5;
 const BACKOFF_BASE_MS = 5000;
-const JOB_TIMEOUT_MS = 5 * 60 * 1000;  // treo > 5 phút -> fail, worker nhả slot chạy prompt kế
+const JOB_TIMEOUT_MS = 10 * 60 * 1000; // cửa sổ poll TRỰC TIẾP. Hết hạn: KHÔNG hủy, chuyển 'stalled'
+                                       // (giữ request_id), nhả slot; reconciler nền lo tiếp.
+const RECONCILE_MS = 30000;            // nhịp đối soát job 'stalled'/mồ côi với provider
+const MAX_AUTO_RETRY_3D = 3;           // Phòng 3D: fail -> tự tạo lại (đẩy đầu queue). Trần chặn đốt HP vô hạn.
 
 const runners = new Map();      // batchId -> { paused, cancelled }
 
@@ -117,12 +121,26 @@ function runSingleJob(cfg, job) {
 
 // ---- videoProviderService: single-job lifecycle ----
 
+// Payload gửi provider chỉ chứa field provider hiểu. Frame rút gọn về { url }:
+// tên file ảnh (dùng đặt tên video Phòng 3D) lưu trong DB nhưng KHÔNG đẩy xuống provider.
+function providerPayload(payload) {
+  const p = { ...payload };
+  if (p.startFrame?.url) p.startFrame = { url: p.startFrame.url }; else delete p.startFrame;
+  if (p.endFrame?.url) p.endFrame = { url: p.endFrame.url }; else delete p.endFrame;
+  delete p.mode; // field nội bộ (đặt tên/queue 3D), provider không hiểu
+  return p;
+}
+
 async function submitVideoJob(cfg, job) {
   const v = validateVideoPayload(job.provider, job.model_id, job.payload);
   if (!v.ok) { patchJob(job, { status: "failed", error_message: v.errors.join("; ") }); return; }
   patchJob(job, { status: "submitting" });
-  const resp = await maxcheapai.generateVideo(cfg, job.payload);
+  const resp = await maxcheapai.generateVideo(cfg, providerPayload(job.payload));
   patchJob(job, { status: "processing", request_id: String(resp.requestId ?? "") });
+  // Học giá HP thực (hpCost) theo combo model+setting -> lần sau ước tính trước khi bấm.
+  const p = job.payload || {};
+  cfgSvc.learnHpPrice({ modelId: p.modelId, resolution: p.resolution, duration: p.duration,
+    speed: p.speed, generateAudio: p.generateAudio }, resp.hpCost);
 }
 
 async function pollVideoJob(cfg, job, control) {
@@ -130,8 +148,15 @@ async function pollVideoJob(cfg, job, control) {
   while (!control.cancelled) {
     if (control.paused) { await sleep(1000); continue; }
     if (Date.now() > deadline) {
-      patchJob(job, { status: "failed",
-        error_message: `Quá thời gian chờ (> ${JOB_TIMEOUT_MS / 60000} phút) — có thể provider bị treo` });
+      // KHÔNG tự hủy: request đã gửi (HP có thể đã trừ). Chuyển 'stalled' + giữ request_id,
+      // nhả slot cho job kế. Reconciler nền sẽ hỏi provider tới khi có kết quả CHẮC CHẮN.
+      if (job.request_id) {
+        patchJob(job, { status: "stalled",
+          error_message: `Chờ lâu (> ${JOB_TIMEOUT_MS / 60000} phút) — đang đối soát với provider` });
+      } else {
+        // Chưa hề submit được -> không có gì để đối soát.
+        patchJob(job, { status: "failed", error_message: "Không gửi được yêu cầu tới provider" });
+      }
       return;
     }
     await sleep(POLL_MS);
@@ -197,16 +222,32 @@ async function runQueue(cfg, concurrency, control) {
         continue;
       }
       control.active++;
-      try { await runJob(cfg, job, control); }
+      try {
+        await runJob(cfg, job, control);
+        maybeAutoRetry3d(control, job); // giữ active>0 khi đẩy retry -> worker khác không thoát sớm
+      }
       finally { control.active--; }
     }
   });
   await Promise.all(workers);
 }
 
+// Phòng 3D: 1 video fail -> tự tạo lại (bản mới cùng prompt/payload) và ĐẨY LÊN ĐẦU hàng đợi
+// để ưu tiên làm lại ngay. Trần MAX_AUTO_RETRY_3D chặn lặp vô hạn khi lỗi cố hữu (đốt HP).
+function maybeAutoRetry3d(control, job) {
+  if (control.mode !== "3d" || control.cancelled || job.status !== "failed") return;
+  const tried = job.autoRetry || 0;
+  if (tried >= MAX_AUTO_RETRY_3D) return;
+  const row = db.prepare("SELECT * FROM video_jobs WHERE id=?").get(job.id); // cần bản DB đầy đủ field
+  if (!row) return;
+  const retry = buildRetryJob(row);
+  retry.autoRetry = tried + 1;
+  control.queue.unshift(retry); // đầu hàng đợi -> chạy trước các job đang chờ
+}
+
 // Kick off a batch in the background; returns immediately.
-function startBatch({ userId, batchId, cfg, jobs, concurrency }) {
-  const control = { paused: false, cancelled: false, queue: [...jobs], active: 0, cfg,
+function startBatch({ userId, batchId, cfg, jobs, concurrency, mode }) {
+  const control = { paused: false, cancelled: false, queue: [...jobs], active: 0, cfg, mode: mode || "normal",
     limit: Math.max(1, parseInt(concurrency, 10) || 2) };
   runners.set(batchId, control);
   runQueue(cfg, control.limit, control)
@@ -232,16 +273,70 @@ function pauseBatch(batchId) { const c = runners.get(batchId); if (c) c.paused =
 function resumeBatch(batchId) { const c = runners.get(batchId); if (c) c.paused = false; }
 function cancelBatch(batchId) {
   const c = runners.get(batchId); if (c) c.cancelled = true;
+  const t = now();
+  // Job CHƯA gửi (không request_id): huỷ an toàn — chưa trừ HP.
   db.prepare(`UPDATE video_jobs SET status='failed', error_message='đã hủy', updated_at=?
-    WHERE batch_id=? AND status IN ('queued','submitting','processing')`).run(now(), batchId);
+    WHERE batch_id=? AND status IN ('queued','submitting','processing')
+      AND (request_id='' OR request_id IS NULL)`).run(t, batchId);
+  // Job ĐÃ gửi (có request_id, HP có thể đã trừ): KHÔNG tự hủy — chuyển 'stalled' để đối soát,
+  // provider mới là nơi chốt kết quả & hoàn HP nếu lỗi.
+  db.prepare(`UPDATE video_jobs SET status='stalled',
+    error_message='Đã dừng theo dõi — đang đối soát với provider', updated_at=?
+    WHERE batch_id=? AND status IN ('submitting','processing') AND request_id<>''`).run(t, batchId);
 }
 
 function getBatchJobs(batchId) {
   return db.prepare("SELECT * FROM video_jobs WHERE batch_id=? ORDER BY id").all(batchId);
 }
 
+// ---- Reconciler: đối soát job 'stalled' với provider ----
+// Chỉ chốt job khi API trả kết quả CHẮC CHẮN (success | failed/error). Lỗi mạng/429/5xx
+// hoặc còn pending -> GIỮ NGUYÊN 'stalled', thử lại nhịp sau. Không bao giờ tự bịa lỗi/tự hủy.
+async function reconcileStalledJobs(cfg) {
+  const rows = db.prepare("SELECT * FROM video_jobs WHERE status='stalled' AND request_id<>''").all();
+  for (const job of rows) {
+    let g;
+    try { g = await maxcheapai.getVideoGeneration(cfg, job.request_id); }
+    catch { continue; } // mạng/429/timeout: chờ nhịp sau, không đổi trạng thái
+    const st = String(g.status || "").toLowerCase();
+    if (st === "success" || st === "succeeded" || st === "completed") {
+      patchJob(job, { status: "success",
+        result_url: g.resultVideoUrl || g.videoUrl || "", thumbnail_url: g.thumbnailUrl || "" });
+    } else if (st === "failed" || st === "error") {
+      patchJob(job, { status: "failed", error_message: g.error || g.errorMessage || "failed" });
+    }
+    // pending/processing: provider vẫn đang render -> giữ 'stalled', đối soát tiếp nhịp sau.
+  }
+}
+
+let reconcileTimer = null;
+// getCfg: hàm trả cfg mới nhất (apiKey có thể đổi lúc chạy). Chạy nền, không chặn thoát tiến trình.
+function startReconciler(getCfg) {
+  if (reconcileTimer) return;
+  const tick = async () => {
+    try { const cfg = getCfg?.(); if (cfg?.apiKey) await reconcileStalledJobs(cfg); } catch {}
+  };
+  reconcileTimer = setInterval(tick, RECONCILE_MS);
+  reconcileTimer.unref?.();
+  tick();
+}
+
+// Gọi 1 lần khi server khởi động: runner in-memory đã chết sau restart.
+// - Đã submit (có request_id): chuyển 'stalled' -> reconciler lo, KHÔNG mất kết quả/HP.
+// - Chưa submit (không request_id): 'failed' (chưa trừ HP), user tạo lại được.
+function recoverOrphansOnBoot() {
+  const t = now();
+  db.prepare(`UPDATE video_jobs SET status='stalled',
+    error_message='Server khởi động lại — đang đối soát với provider', updated_at=?
+    WHERE status IN ('submitting','processing') AND request_id<>''`).run(t);
+  db.prepare(`UPDATE video_jobs SET status='failed',
+    error_message='Server khởi động lại trước khi gửi yêu cầu', updated_at=?
+    WHERE status IN ('queued','submitting','processing') AND (request_id='' OR request_id IS NULL)`).run(t);
+}
+
 module.exports = {
   buildJobsFromPrompts, submitVideoJob, pollVideoJob, runQueue,
   startBatch, pauseBatch, resumeBatch, cancelBatch, getBatchJobs,
   buildReviseJob, runSingleJob, buildRetryJob, enqueueJob,
+  reconcileStalledJobs, startReconciler, recoverOrphansOnBoot,
 };

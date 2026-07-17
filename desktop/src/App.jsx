@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { setToken } from "./api";
+import { useHp, refreshHp } from "./hpStore";
 import Login from "./Login";
 import Users from "./Users";
 import ApiConfig from "./Settings";
@@ -35,6 +36,7 @@ export default function App() {
     <div className="app">
       <div className="sidebar">
         <h2>Generation Prompt v1</h2>
+        <HpBox />
         <div className="nav-sep">Chức năng</div>
         {USER_NAV.map((n) => (
           <div key={n.key} className={"nav-item " + (tab === n.key ? "active" : "")}
@@ -70,6 +72,23 @@ export default function App() {
 const Tab = ({ show, children }) => (
   <div style={{ display: show ? "block" : "none" }}>{children}</div>
 );
+
+// Box HP: viền xanh phát sáng, nền xanh nhạt trong suốt, số HP xanh ở giữa.
+// Số dư lấy từ GET /hp, poll mỗi 60s + refresh ngay khi mở app.
+const HpBox = () => {
+  const { balance, loading } = useHp();
+  useEffect(() => {
+    refreshHp();
+    const t = setInterval(refreshHp, 60000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <div className="hp-box" title="Số HP hiện có của tài khoản API">
+      <span className="hp-value">{balance == null ? (loading ? "…" : "--") : balance.toLocaleString()}</span>
+      <span className="hp-label">HP</span>
+    </div>
+  );
+};
 
 // Module đang phát triển: ẩn nội dung, chỉ báo trạng thái.
 const ComingSoon = ({ title }) => (

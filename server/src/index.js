@@ -133,6 +133,20 @@ app.get("/api/video-models", authRequired, (req, res) => {
   });
 });
 
+// Số dư HP (credit) của tài khoản MaxCheapAI + bảng giá HP đã học (để ước tính trước khi tạo).
+// Balance lấy trực tiếp từ provider GET /hp; prices là bảng tự học server-side.
+app.get("/api/hp", authRequired, async (req, res) => {
+  const { cfg } = cfgSvc.getVideoApiConfig();
+  const prices = cfgSvc.getHpPrices();
+  if (!cfg?.apiKey) return res.json({ balance: null, prices, error: "Chưa cấu hình API key video" });
+  try {
+    const hp = await maxcheapai.getHpBalance(cfg);
+    res.json({ balance: hp.totalHp ?? null, freeHp: hp.freeHp ?? null, paidHp: hp.paidHp ?? null, prices });
+  } catch (e) {
+    res.json({ balance: null, prices, error: e.message });
+  }
+});
+
 // Which prompt model is active (any logged-in user may read, keys stripped).
 app.get("/api/active-model", authRequired, (req, res) => {
   const s = JSON.parse(db.prepare("SELECT value FROM settings WHERE key='settings'").get().value);
@@ -234,6 +248,7 @@ app.get("/api/video-projects/:id/batches", authRequired, (req, res) => {
       promptText: j.prompt_text, generateAudio: !!p.generateAudio,
       startFrame: p.startFrame || null, endFrame: p.endFrame || null,
       parentJobId: j.parent_job_id || null, version: j.version || 1,
+      mode: p.mode || "normal", // mode lúc tạo -> đặt tên ổn định dù đổi phòng ban
     };
     if (!byBatch.has(j.batch_id)) byBatch.set(j.batch_id, { name: j.batch_name || "", jobs: [] });
     byBatch.get(j.batch_id).jobs.push(job);
@@ -242,6 +257,7 @@ app.get("/api/video-projects/:id/batches", authRequired, (req, res) => {
     const count = (s) => jobs.filter((x) => x.status === s).length;
     return { batchId, batchName: name, total: jobs.length, jobs, success: count("success"), failed: count("failed"),
       processing: jobs.filter((x) => ["submitting", "processing", "queued"].includes(x.status)).length,
+      stalled: count("stalled"), // đã gửi provider, đang đối soát nền (chưa chốt)
       createdAt: jobs[0]?.createdAt };
   });
   res.json({ batches });
@@ -276,12 +292,14 @@ app.post("/api/video-jobs/:id/revise", authRequired, async (req, res) => {
     aspectRatio: pick(o.aspectRatio, base.aspectRatio),
     generateAudio: o.generateAudio ?? base.generateAudio ?? false,
     prompt,
+    mode: base.mode || "normal", // giữ mode gốc -> tên video bản sửa vẫn theo đúng phòng
   };
   // Ảnh đầu/cuối: dùng giá trị mới nếu client gửi (kể cả null để xóa), else giữ của bản gốc.
+  // Giữ cả `name` (tên file ảnh) để Phòng 3D đặt tên bản sửa đúng frame.
   const sf = req.body?.startFrame !== undefined ? req.body.startFrame : base.startFrame;
   const ef = req.body?.endFrame !== undefined ? req.body.endFrame : base.endFrame;
-  if (sf?.url) payload.startFrame = { url: sf.url };
-  if (ef?.url) payload.endFrame = { url: ef.url };
+  if (sf?.url) payload.startFrame = { url: sf.url, ...(sf.name ? { name: sf.name } : {}) };
+  if (ef?.url) payload.endFrame = { url: ef.url, ...(ef.name ? { name: ef.name } : {}) };
 
   const v = validateVideoPayload(provider, modelId, payload);
   if (!v.ok) return res.status(400).json({ error: v.errors.join("; ") });
@@ -473,9 +491,10 @@ app.put("/api/scenarios/:id", authRequired, (req, res) => {
 // ---- Video jobs: build queue from prompts + run against MaxCheapAI ----
 // Body: { projectId, prompts: [{ id, promptText, videoCount }], overrides?: {...model options} }
 app.post("/api/video-jobs", authRequired, async (req, res) => {
-  const { prompts, overrides, projectId, batchName } = req.body || {};
+  const { prompts, overrides, projectId, batchName, mode } = req.body || {};
   if (!Array.isArray(prompts) || prompts.length === 0)
     return res.status(400).json({ error: "Thiếu danh sách prompt" });
+  const runMode = mode === "3d" ? "3d" : "normal"; // 3d: auto-retry đẩy đầu queue khi fail
 
   // Video luôn gắn 1 dự án video để lưu trữ/xem lại theo dự án.
   if (!projectId || !ownedVideoProject(req.user, projectId))
@@ -497,6 +516,7 @@ app.post("/api/video-jobs", authRequired, async (req, res) => {
     speed: pick(o.speed, cfg.speed),
     aspectRatio: pick(o.aspectRatio, cfg.aspectRatio),
     generateAudio: o.generateAudio ?? cfg.generateAudio ?? false, // boolean: giữ false hợp lệ
+    mode: runMode, // gắn theo TỪNG video: đổi phòng ban sau không đổi tên video đã tạo
   };
   // startFrame/endFrame giờ theo TỪNG prompt (mỗi hàng có ảnh riêng), không phải override chung.
 
@@ -523,7 +543,7 @@ app.post("/api/video-jobs", authRequired, async (req, res) => {
 
   const batchId = crypto.randomUUID();
   const jobs = queue.buildJobsFromPrompts(req.user.id, batchId, prompts, provider, modelId, basePayload, projectId, String(batchName || "").trim());
-  queue.startBatch({ userId: req.user.id, batchId, cfg, jobs, concurrency });
+  queue.startBatch({ userId: req.user.id, batchId, cfg, jobs, concurrency, mode: runMode });
   log(req.user.id, "video_batch_start", `${jobs.length} jobs @ ${provider}/${modelId} (project ${projectId})`);
   res.json({ batchId, total: jobs.length });
 });
@@ -537,11 +557,15 @@ app.get("/api/video-jobs/:batchId", authRequired, (req, res) => {
       requestId: j.request_id, resultVideoUrl: j.result_url, thumbnailUrl: j.thumbnail_url,
       errorMessage: j.error_message, updatedAt: j.updated_at, createdAt: j.created_at,
       modelId: j.model_id, resolution: p.resolution, aspectRatio: p.aspectRatio, speed: p.speed, duration: p.duration,
+      promptText: j.prompt_text, startFrame: p.startFrame || null, endFrame: p.endFrame || null, // Phòng 3D: đặt tên theo tên ảnh
+      mode: p.mode || "normal", // mode lúc tạo video này -> đặt tên ổn định
     };
   });
   const count = (s) => jobs.filter((j) => j.status === s).length;
+  // 'stalled' KHÔNG tính vào processing: runner đã nhả slot, vòng chạy coi như xong.
+  // Reconciler nền lo tiếp; client thấy job stalled qua field riêng + lịch sử.
   res.json({ batchId: req.params.batchId, total: jobs.length, jobs,
-    success: count("success"), failed: count("failed"),
+    success: count("success"), failed: count("failed"), stalled: count("stalled"),
     processing: jobs.filter((j) => ["submitting", "processing", "queued"].includes(j.status)).length });
 });
 
@@ -616,5 +640,14 @@ app.get("/api/logs", authRequired, (req, res) => {
   res.json(rows);
 });
 
+// Sau restart: runner in-memory đã mất. Cứu job dở dang (đã gửi provider -> 'stalled' để
+// đối soát; chưa gửi -> 'failed'), rồi bật reconciler nền đối soát 'stalled' tới khi có kết quả.
+queue.recoverOrphansOnBoot();
+queue.startReconciler(() => cfgSvc.getVideoApiConfig().cfg);
+
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Server chạy tại http://localhost:${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server chạy tại http://localhost:${PORT}`);
+  // Báo cho tiến trình cha (Electron main) biết server đã sẵn sàng nhận request.
+  if (process.send) process.send({ type: "server-ready", port: PORT });
+});

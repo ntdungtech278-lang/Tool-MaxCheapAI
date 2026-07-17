@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
+import { useHp, estimate, optimisticDeduct, refreshHp } from "./hpStore";
+import { threeDBaseName } from "./name3d";
 import ConfirmDialog from "./ConfirmDialog";
+
+// Phòng ban: chọn để bật quy trình riêng. "Phòng 3D" -> mode 3D (đặt tên theo tên ảnh,
+// khoá tên lượt, gộp nút Tải+Sheet, auto tạo lại khi fail). Thêm phòng ban mới ở đây để scale.
+const DEPARTMENTS = ["Phòng 3D"];
 
 // Module "Tạo video". Mỗi dòng = 1 prompt. Mỗi prompt có ô "số video" -> tạo
 // videoCount job cho prompt đó. Job hiển thị NHÓM THEO PROMPT thành từng hàng
@@ -14,6 +20,7 @@ const ST = {
   processing: { label: "Đang xử lý",  cls: "busy", spin: true },
   pending:    { label: "Đang chờ",    cls: "busy", spin: true },
   success:    { label: "Xong",        cls: "on" },
+  stalled:    { label: "Đối soát",    cls: "busy", spin: true }, // đã gửi provider, chờ chốt kết quả nền
   failed:     { label: "Lỗi",         cls: "off" },
 };
 
@@ -52,6 +59,27 @@ function videoFileName(projectName, j) {
   const order = `${promptNo}.${Math.max(0, (j.attemptIndex || 1) - 1)}`;
   const ver = (j.version || 1) > 1 ? `_v${j.version}` : ""; // bản chỉnh sửa
   return `${proj}_${lot}_${order}${ver}`;
+}
+
+// Phòng 3D: tên = [Mã tập]_[Frame đầu]_[Frame cuối] (từ tên ảnh). Nhiều video cùng 1 tên gốc
+// (prompt tạo nhiều / tạo lại) -> thêm _1, _2 theo thứ tự. Trả map { jobId: tên }.
+function threeDNamesFor(jobs) {
+  const groups = new Map();
+  for (const j of jobs) {
+    const base = threeDBaseName(j.startFrame?.name, j.endFrame?.name);
+    if (!groups.has(base)) groups.set(base, []);
+    groups.get(base).push(j);
+  }
+  const names = {};
+  for (const [base, list] of groups) {
+    // Chỉ video Xong mới hiện/tải tên -> đánh số _1,_2 liên tục cho riêng nhóm Xong (bỏ qua job lỗi
+    // để không tạo lỗ số). Job chưa xong vẫn có tên gốc (fallback) nhưng UI không hiển thị.
+    const done = list.filter((j) => j.status === "success").sort((a, b) => (a.attemptIndex || 1) - (b.attemptIndex || 1) || a.id - b.id);
+    const multi = done.length > 1;
+    done.forEach((j, i) => { names[j.id] = sanitizeName(multi ? `${base}_${i + 1}` : base); });
+    for (const j of list) if (!names[j.id]) names[j.id] = sanitizeName(base); // job chưa xong: tên gốc
+  }
+  return names;
 }
 
 // ---- Wrapper: danh sách DỰ ÁN VIDEO. Mở dự án -> vào trang tạo video của dự án đó. ----
@@ -131,6 +159,8 @@ function VideoStudio({ project, onBack }) {
   const [rows, setRows] = useState([emptyRow()]);
   const [models, setModels] = useState([]);
   const [batchName, setBatchName] = useState(""); // tên lượt: đặt tên file video khi tải
+  const [department, setDepartment] = useState(""); // "" = mặc định (giữ nguyên UI cũ)
+  const is3D = department === "Phòng 3D";
   const [promptsCollapsed, setPromptsCollapsed] = useState(false); // thu gọn khu nhập prompt sau khi Tạo
   // Cấu hình tạo video (chuyển từ tab Cấu hình API sang đây). Khởi tạo từ settings đã lưu.
   const [cfg, setCfg] = useState({
@@ -192,7 +222,7 @@ function VideoStudio({ project, onBack }) {
   useEffect(() => { loadHistory(); }, [project.id]);
 
   // Khi có video đang tạo lại (revise) trong lịch sử -> poll để cập nhật tới khi xong.
-  const historyBusy = history.some((h) => h.processing > 0);
+  const historyBusy = history.some((h) => h.processing > 0 || h.stalled > 0); // stalled: reconciler nền còn chạy
   useEffect(() => {
     if (!historyBusy || batchId) return; // batchId đang chạy đã có poll riêng
     const t = setInterval(loadHistory, 5000);
@@ -212,6 +242,7 @@ function VideoStudio({ project, onBack }) {
           setBatch(null);
           setRows([emptyRow()]); setBatchName(""); setBatchId(null); setPaused(false); setPromptsCollapsed(false);
           loadHistory(); // đồng bộ lịch sử dự án từ server (đã lưu batch vừa xong)
+          refreshHp();   // lấy HP thực sau khi xong: provider đã hoàn nếu có job lỗi
         }
       } catch (e) { setErr(e.message); }
     };
@@ -223,6 +254,12 @@ function VideoStudio({ project, onBack }) {
   const validRows = rows.filter((r) => r.prompt.trim());
   const totalJobs = validRows.reduce((n, r) => n + Math.max(1, parseInt(r.videoCount, 10) || 1), 0);
   const anyUploading = rows.some((r) => r.upStart || r.upEnd);
+
+  // audio thực gửi xuống (khớp start()): sora ép tắt override, kling-2.6 khóa khi có ảnh cuối.
+  const effAudio = mopts.audioForced ? false : (audioLocked ? false : cfg.generateAudio);
+  // Ước tính HP: đơn giá học được cho combo model+setting × tổng số video.
+  const hpEst = estimate({ modelId: cfg.modelId, resolution: cfg.resolution,
+    duration: cfg.duration, speed: cfg.speed, generateAudio: effAudio }, totalJobs);
 
   const patchRow = (i, patch) => setRows((rs) => rs.map((r, k) => (k === i ? { ...r, ...patch } : r)));
   const addRow = () => setRows((rs) => [...rs, emptyRow()]);
@@ -243,7 +280,8 @@ function VideoStudio({ project, onBack }) {
           fr.readAsDataURL(file);
         });
         const r = await api.uploadImage(dataUrl, file.name);
-        patchRow(i, { [which]: { url: r.url, preview: dataUrl }, [upKey]: false });
+        // Lưu name = tên file gốc để Phòng 3D đặt tên video theo [Mã tập]_[Frame].
+        patchRow(i, { [which]: { url: r.url, preview: dataUrl, name: file.name }, [upKey]: false });
       } catch (e) { patchRow(i, { [upKey]: false }); setErr(e.message); }
     };
     inp.click();
@@ -256,11 +294,12 @@ function VideoStudio({ project, onBack }) {
     if (anyUploading) { setErr("Đang tải ảnh lên, vui lòng đợi."); return; }
     try {
       // id ổn định p1,p2... để nhóm job theo prompt; kèm ảnh đầu/cuối của từng hàng.
+      // name = tên file ảnh: Phòng 3D dùng đặt tên video; provider bỏ qua (queueService strip).
       const items = validRows.map((r, i) => ({
         id: `p${i + 1}`, promptText: r.prompt.trim(),
         videoCount: Math.max(1, parseInt(r.videoCount, 10) || 1),
-        ...(mopts.startFrame && r.startFrame?.url ? { startFrame: { url: r.startFrame.url } } : {}),
-        ...(mopts.endFrame && r.endFrame?.url ? { endFrame: { url: r.endFrame.url } } : {}),
+        ...(mopts.startFrame && r.startFrame?.url ? { startFrame: { url: r.startFrame.url, name: r.startFrame.name || "" } } : {}),
+        ...(mopts.endFrame && r.endFrame?.url ? { endFrame: { url: r.endFrame.url, name: r.endFrame.name || "" } } : {}),
       }));
       const { batchId: id } = await api.startVideoJobs(items, {
         modelId: cfg.modelId, speed: cfg.speed, resolution: cfg.resolution,
@@ -268,8 +307,10 @@ function VideoStudio({ project, onBack }) {
         // sora tự bật audio; kling-2.6 khóa audio khi có ảnh cuối.
         generateAudio: mopts.audioForced ? false : (audioLocked ? false : cfg.generateAudio),
         concurrency: cfg.concurrency,
-      }, project.id, batchName.trim());
+      }, project.id, is3D ? "" : batchName.trim(), is3D ? "3d" : "normal");
       setBatch(null); setBatchId(id); setPaused(false); setDl(null); setPromptsCollapsed(true);
+      if (hpEst.known) optimisticDeduct(hpEst.total); // trừ ngay; số thực đồng bộ sau
+      setTimeout(refreshHp, 8000); // sau khi job submit xong, lấy hpBalance thực + học giá combo mới
     } catch (e) { setErr(e.message); }
   }
   async function pause() { await api.pauseBatch(batchId); setPaused(true); }
@@ -285,6 +326,15 @@ function VideoStudio({ project, onBack }) {
   const doneJobs = allJobs.filter((j) => j.status === "success" && j.resultVideoUrl);
   // Video sẽ tải = các video đã đánh dấu "Đạt".
   const markedJobs = doneJobs.filter((j) => marked[j.id]);
+
+  // Tên file đặt theo MODE CỦA TỪNG VIDEO (lúc tạo), không theo phòng ban đang chọn -> đổi
+  // phòng ban không đổi tên video đã tạo. Video mode "3d": [Mã tập]_[Frame đầu]_[Frame cuối]
+  // (gom cùng tên -> _1,_2). Mode thường: giữ cơ chế cũ (dự án_lượt_thứ tự).
+  const is3DJob = (j) => j.mode === "3d";
+  const threeDNames = threeDNamesFor(allJobs.filter(is3DJob)); // đánh số _1,_2 chỉ trong nhóm 3D
+  const nameOf = (j) => (is3DJob(j)
+    ? (threeDNames[j.id] || threeDBaseName(j.startFrame?.name, j.endFrame?.name))
+    : videoFileName(project.name, j));
 
   async function download() {
     setDl(null); setErr("");
@@ -305,11 +355,13 @@ function VideoStudio({ project, onBack }) {
     setDl({ message: `Đang tải ${markedJobs.length} video...` });
     try {
       const items = markedJobs.map((j) => ({
-        url: j.resultVideoUrl, name: videoFileName(project.name, j) + ".mp4",
+        url: j.resultVideoUrl, name: nameOf(j) + ".mp4",
       }));
       const r = await api.downloadVideos(dir, items);
       setDl(null);
       showToast(`Đã tải ${r.success}/${r.total} video vào ${r.dir}`, r.success === r.total);
+      // Phòng 3D: sau khi chọn folder & tải xong -> tự xuất Sheet (nút gộp làm 1).
+      if (is3D) await exportSheet(true);
     } catch (e) { setDl(null); showToast(e.message, false); }
   }
 
@@ -326,22 +378,31 @@ function VideoStudio({ project, onBack }) {
   }
 
   // Xuất prompt + ảnh đầu/cuối của các video ĐẠT ra Google Sheet.
+  // auto=true (Phòng 3D, gọi sau khi tải): không mở tab Sheet, chỉ báo nhẹ; lỗi Sheet không chặn việc tải.
   const [exporting, setExporting] = useState(false);
-  async function exportSheet() {
-    if (markedJobs.length === 0) { showToast("Chưa có video nào được đánh dấu Đạt.", false); return; }
+  async function exportSheet(auto = false) {
+    if (markedJobs.length === 0) { if (!auto) showToast("Chưa có video nào được đánh dấu Đạt.", false); return; }
     setExporting(true);
     try {
-      const items = markedJobs.map((j) => ({
-        prompt: j.promptText || "",
-        startUrl: j.startFrame?.url || "",
-        endUrl: j.endFrame?.url || "",
-      }));
+      // Cột ảnh ghi TEXT theo mode từng video: 3d -> tên file ảnh (bỏ đuôi .png/.jpg...),
+      // thường -> URL ảnh (không nhúng =IMAGE cho nhẹ). Không có ảnh -> trống.
+      const stripExt = (n) => String(n || "").replace(/\.(png|jpe?g|webp|gif|bmp|tiff?)$/i, "");
+      const items = markedJobs.map((j) => {
+        const threeD = is3DJob(j);
+        return {
+          prompt: j.promptText || "",
+          start: threeD ? stripExt(j.startFrame?.name) : (j.startFrame?.url || ""),
+          end: threeD ? stripExt(j.endFrame?.name) : (j.endFrame?.url || ""),
+        };
+      });
       const title = `${project.name} - prompts (${markedJobs.length})`;
       const r = await api.exportSheet(title, items);
       showToast("Đã xuất Google Sheet", true);
-      if (window.desktop?.openExternal) window.desktop.openExternal(r.url);
-      else window.open(r.url, "_blank");
-    } catch (e) { showToast(e.message, false); }
+      if (!auto) {
+        if (window.desktop?.openExternal) window.desktop.openExternal(r.url);
+        else window.open(r.url, "_blank");
+      }
+    } catch (e) { showToast(auto ? `Đã tải video. Xuất Sheet lỗi: ${e.message}` : e.message, false); }
     finally { setExporting(false); }
   }
 
@@ -412,6 +473,13 @@ function VideoStudio({ project, onBack }) {
         {/* Cấu hình tạo video (chuyển từ tab Cấu hình API sang đây) */}
         <div className="settings-grid">
           <div>
+            <label>Phòng ban</label>
+            <select value={department} onChange={(e) => setDepartment(e.target.value)} disabled={!!batchId}>
+              <option value="">— Mặc định —</option>
+              {DEPARTMENTS.map((d) => <option key={d} value={d}>{d}</option>)}
+            </select>
+          </div>
+          <div>
             <label>Model</label>
             <select value={cfg.modelId} onChange={(e) => setCfgField("modelId", e.target.value)} disabled={!!batchId}>
               {models.map((m) => <option key={m} value={m}>{m}</option>)}
@@ -455,8 +523,9 @@ function VideoStudio({ project, onBack }) {
           </div>
           <div>
             <label>Tên lượt (đặt tên file)</label>
-            <input type="text" value={batchName} disabled={!!batchId} maxLength={60}
-              placeholder="vd: lan1" onChange={(e) => setBatchName(e.target.value)} />
+            <input type="text" value={is3D ? "" : batchName} disabled={!!batchId || is3D} maxLength={60}
+              placeholder={is3D ? "Phòng 3D: đặt tên theo tên ảnh" : "vd: lan1"}
+              onChange={(e) => setBatchName(e.target.value)} />
           </div>
           {mopts.audioForced ? (
             <div>
@@ -530,6 +599,11 @@ function VideoStudio({ project, onBack }) {
           <div className="toolbar" style={{ marginTop: 10, marginBottom: 0 }}>
             {!batchId && <button className="secondary" onClick={addRow}>+ Thêm prompt</button>}
             <span className="spacer" />
+            {!batchId && totalJobs > 0 && (
+              <span className="hp-cost" title={hpEst.known ? "HP ước tính sẽ trừ cho lượt này" : "Chưa có giá cho model/thiết lập này — sẽ cập nhật sau lần tạo đầu"}>
+                {hpEst.known ? <>~<b>{hpEst.total.toLocaleString()}</b> HP</> : "HP: chưa cập nhật"}
+              </span>
+            )}
             {!batchId && <button onClick={start} disabled={validRows.length === 0 || anyUploading}>Tạo video ({totalJobs})</button>}
           </div>
         )}
@@ -542,6 +616,9 @@ function VideoStudio({ project, onBack }) {
             <strong>{done}/{total} video</strong>
             <span className="badge on">✓ {batch.success}</span>
             <span className="badge off">✗ {batch.failed}</span>
+            {batch.stalled > 0 && (
+              <span className="badge busy" title="Đã gửi provider — đang đối soát kết quả"><i className="spin" />⇄ {batch.stalled}</span>
+            )}
             <span className="badge busy">{running && <i className="spin" />}⋯ {batch.processing}</span>
             <span className="spacer" />
             {running && !paused && <button className="secondary" onClick={pause}>Tạm dừng</button>}
@@ -569,7 +646,7 @@ function VideoStudio({ project, onBack }) {
                 const jn = { ...j, _batchName: bt === batch ? batchName : bt.batchName, _promptNo: gi + 1 };
                 return <JobCell key={j.id} j={jn} promptNo={gi + 1} onOpen={() => setPreview(jn)}
                   marked={!!marked[j.id]} onMark={() => toggleMark(j.id)}
-                  fileName={videoFileName(project.name, jn)} onRetry={retryVideo} onDeleteFail={deleteVideo} />;
+                  fileName={nameOf(jn)} onRetry={retryVideo} onDeleteFail={deleteVideo} />;
               })
             )}
           </div>
@@ -583,21 +660,26 @@ function VideoStudio({ project, onBack }) {
 
       {preview && (
         <PreviewModal job={preview} projectName={project.name} models={models}
-          fileNameBase={videoFileName(project.name, preview)}
+          fileNameBase={nameOf(preview)}
           onClose={() => setPreview(null)}
           onDownloadOne={downloadOne}
           onRevise={reviseVideo}
           onDelete={async (id) => { await deleteVideo(id); setPreview(null); }} />
       )}
 
-      {/* Thanh nổi góc dưới-phải: luôn thấy khi cuộn. Hiện khi có video đã đánh dấu Đạt. */}
+      {/* Thanh nổi góc dưới-phải: luôn thấy khi cuộn. Hiện khi có video đã đánh dấu Đạt.
+          Phòng 3D: gộp Xuất Sheet + Tải thành 1 nút "Tải video" (chọn folder -> tải -> tự xuất Sheet). */}
       {markedJobs.length > 0 && (
         <div className="download-bar">
-          <button className="secondary" onClick={exportSheet} disabled={exporting}>
-            {exporting ? <><i className="spin" /> Đang xuất...</> : "Xuất Sheet"}
-          </button>
-          <button onClick={download} disabled={!!dl?.message}>
-            {dl?.message ? <><i className="spin" /> Đang tải...</> : `Tải ${markedJobs.length} video`}
+          {!is3D && (
+            <button className="secondary" onClick={() => exportSheet()} disabled={exporting}>
+              {exporting ? <><i className="spin" /> Đang xuất...</> : "Xuất Sheet"}
+            </button>
+          )}
+          <button onClick={download} disabled={!!dl?.message || exporting}>
+            {dl?.message ? <><i className="spin" /> Đang tải...</>
+              : exporting ? <><i className="spin" /> Đang xuất Sheet...</>
+              : `Tải ${markedJobs.length} video`}
           </button>
         </div>
       )}

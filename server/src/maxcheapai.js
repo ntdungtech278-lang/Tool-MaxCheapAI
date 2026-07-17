@@ -68,6 +68,13 @@ async function generateVideo(cfg, payload, { debug } = {}) {
   return parse(res);
 }
 
+// GET /hp -> { freeHp, paidHp, totalHp, checkedInToday, streak }. Số dư HP tài khoản.
+async function getHpBalance(cfg) {
+  const url = joinUrl(baseOf(cfg), "hp");
+  const res = await fetchT(url, { headers: authHeaders(cfg) });
+  return parse(res);
+}
+
 // GET /video-generations/:id -> { status, resultVideoUrl?, thumbnailUrl?, error? }
 async function getVideoGeneration(cfg, id) {
   const url = joinUrl(baseOf(cfg), `video-generations/${id}`);
@@ -101,6 +108,6 @@ async function uploadVideo(cfg, buffer, filename, mime = "video/mp4") {
 }
 
 module.exports = {
-  DEFAULT_BASE, generateVideo, getVideoGeneration, listVideoGenerations,
+  DEFAULT_BASE, generateVideo, getHpBalance, getVideoGeneration, listVideoGenerations,
   uploadImage, uploadVideo, friendlyError,
 };

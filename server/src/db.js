@@ -1,8 +1,14 @@
 const path = require("path");
+const fs = require("fs");
 const Database = require("better-sqlite3");
 const bcrypt = require("bcryptjs");
 
-const db = new Database(path.join(__dirname, "..", "data.db"));
+// DB nằm ở thư mục GHI ĐƯỢC. Khi đóng gói, app chạy trong Program Files (chỉ đọc) nên
+// Electron truyền APP_DATA_DIR = userData; data.db ở đó -> cập nhật/cài đè KHÔNG mất dữ liệu.
+// Dev (chạy từ source): fallback về server/data.db như cũ.
+const DATA_DIR = process.env.APP_DATA_DIR || path.join(__dirname, "..");
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+const db = new Database(path.join(DATA_DIR, "data.db"));
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 

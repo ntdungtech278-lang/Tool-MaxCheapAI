@@ -43,9 +43,7 @@ function clientFromRefresh(clientId, clientSecret, refreshToken) {
   return o;
 }
 
-const A1 = (s) => `"${String(s ?? "").replace(/"/g, '""')}"`; // escape cho =IMAGE / literal
-
-// items: [{ prompt, startUrl, endUrl }]. title: tên sheet. folderId: (tùy) thư mục Drive để gom.
+// items: [{ prompt, start|startUrl, end|endUrl }]. title: tên sheet. folderId: (tùy) thư mục Drive để gom.
 // auth: OAuth2 client (clientFromRefresh). Trả { url, spreadsheetId }.
 async function exportPromptsSheet({ auth, title, items, folderId }) {
   const sheets = google.sheets({ version: "v4", auth });
@@ -66,14 +64,16 @@ async function exportPromptsSheet({ auth, title, items, folderId }) {
   const sheetId = meta.data.sheets[0].properties.sheetId;
   const sheetName = meta.data.sheets[0].properties.title; // "Sheet1" mặc định — không hardcode
 
-  // Ghi dữ liệu: header + mỗi video 1 hàng. Ảnh dùng =IMAGE(url) để hiện luôn.
+  // Ghi dữ liệu: header + mỗi video 1 hàng. Cột ảnh ghi TEXT (tên file cho Phòng 3D, hoặc URL
+  // cho mặc định) — không nhúng =IMAGE để tránh sheet nặng. Client quyết định nội dung text.
+  const cell = (it, k, kUrl) => String(it[k] ?? it[kUrl] ?? ""); // tương thích items cũ (startUrl/endUrl)
   const rows = [["STT", "Prompt", "Ảnh đầu", "Ảnh cuối"]];
   items.forEach((it, i) => {
     rows.push([
       i + 1,
       String(it.prompt ?? ""),
-      it.startUrl ? `=IMAGE(${A1(it.startUrl)})` : "",
-      it.endUrl ? `=IMAGE(${A1(it.endUrl)})` : "",
+      cell(it, "start", "startUrl"),
+      cell(it, "end", "endUrl"),
     ]);
   });
   await sheets.spreadsheets.values.update({
@@ -91,8 +91,8 @@ async function exportPromptsSheet({ auth, title, items, folderId }) {
         { repeatCell: { range: { sheetId, startColumnIndex: 0, endColumnIndex: 1 }, cell: { userEnteredFormat: { horizontalAlignment: "CENTER", verticalAlignment: "TOP" } }, fields: "userEnteredFormat(horizontalAlignment,verticalAlignment)" } },
         { updateDimensionProperties: { range: { sheetId, dimension: "COLUMNS", startIndex: 1, endIndex: 2 }, properties: { pixelSize: 420 }, fields: "pixelSize" } }, // Prompt
         { repeatCell: { range: { sheetId, startRowIndex: 1, startColumnIndex: 1, endColumnIndex: 2 }, cell: { userEnteredFormat: { wrapStrategy: "WRAP", verticalAlignment: "TOP" } }, fields: "userEnteredFormat(wrapStrategy,verticalAlignment)" } },
-        { updateDimensionProperties: { range: { sheetId, dimension: "COLUMNS", startIndex: 2, endIndex: 4 }, properties: { pixelSize: 240 }, fields: "pixelSize" } }, // Ảnh đầu/cuối
-        ...(dataRows > 0 ? [{ updateDimensionProperties: { range: { sheetId, dimension: "ROWS", startIndex: 1, endIndex: 1 + dataRows }, properties: { pixelSize: 140 }, fields: "pixelSize" } }] : []),
+        { updateDimensionProperties: { range: { sheetId, dimension: "COLUMNS", startIndex: 2, endIndex: 4 }, properties: { pixelSize: 240 }, fields: "pixelSize" } }, // Ảnh đầu/cuối (text: tên file hoặc URL)
+        { repeatCell: { range: { sheetId, startRowIndex: 1, startColumnIndex: 2, endColumnIndex: 4 }, cell: { userEnteredFormat: { wrapStrategy: "WRAP", verticalAlignment: "TOP" } }, fields: "userEnteredFormat(wrapStrategy,verticalAlignment)" } },
         { repeatCell: { range: { sheetId, startRowIndex: 0, endRowIndex: 1 }, cell: { userEnteredFormat: { textFormat: { bold: true }, horizontalAlignment: "CENTER" } }, fields: "userEnteredFormat(textFormat.bold,horizontalAlignment)" } },
         { updateSheetProperties: { properties: { sheetId, gridProperties: { frozenRowCount: 1 } }, fields: "gridProperties.frozenRowCount" } },
         // Viền lưới toàn bảng (header + data), 4 cột.

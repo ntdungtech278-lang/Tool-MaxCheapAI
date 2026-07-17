@@ -25,6 +25,7 @@ async function req(method, path, body) {
 export const api = {
   login: (username, password) => req("POST", "/login", { username, password }),
   me: () => req("GET", "/me"),
+  hp: () => req("GET", "/hp"),
   users: () => req("GET", "/users"),
   createUser: (u) => req("POST", "/users", u),
   updateUser: (id, u) => req("PUT", `/users/${id}`, u),
@@ -56,7 +57,7 @@ export const api = {
 
   // Video queue.
   videoModels: () => req("GET", "/video-models"),
-  startVideoJobs: (prompts, overrides, projectId, batchName) => req("POST", "/video-jobs", { prompts, overrides, projectId, batchName }),
+  startVideoJobs: (prompts, overrides, projectId, batchName, mode) => req("POST", "/video-jobs", { prompts, overrides, projectId, batchName, mode }),
   reviseVideo: (jobId, body) => req("POST", `/video-jobs/${jobId}/revise`, body),
   retryVideo: (jobId) => req("POST", `/video-jobs/${jobId}/retry`),
   deleteVideoJob: (jobId) => req("DELETE", `/video-jobs/${jobId}`),

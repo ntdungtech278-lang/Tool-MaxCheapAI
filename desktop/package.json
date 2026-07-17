@@ -7,7 +7,9 @@
     "dev:vite": "vite",
     "dev": "concurrently -k \"vite\" \"wait-on tcp:5173 && node electron/launch.js\"",
     "build": "vite build",
-    "start": "electron ."
+    "start": "electron .",
+    "rebuild:sqlite": "electron-rebuild -f -w better-sqlite3 --module-dir ../server",
+    "dist": "vite build && npm run rebuild:sqlite && electron-builder --win nsis"
   },
   "dependencies": {
     "docx": "^9.0.2",
@@ -16,10 +18,44 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@electron/rebuild": "^3.7.2",
     "@vitejs/plugin-react": "^4.3.1",
     "concurrently": "^9.0.1",
     "electron": "^33.0.0",
+    "electron-builder": "^25.1.8",
     "vite": "^5.4.8",
     "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.maxcheapai.tool",
+    "productName": "MaxCheapAI Tool",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../server",
+        "to": "server",
+        "filter": [
+          "**/*",
+          "!**/data.db",
+          "!**/*.db-wal",
+          "!**/*.db-shm",
+          "!jwt-secret"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    }
   }
 }

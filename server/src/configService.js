@@ -121,7 +121,33 @@ function saveSheetTokens({ refreshToken, connectedEmail }) {
   saveSettings(s);
 }
 
+// ---- Bảng giá HP tự học ----
+// Provider trả hpCost thực mỗi lần tạo. Ta lưu theo combo (model+setting) để lần sau
+// ước tính TRƯỚC khi bấm. Học 1 lần/combo là đủ (giá cố định theo combo).
+// key = "model|resolution|duration|speed|audio". audio chuẩn hoá về "1"/"0".
+function hpPriceKey({ modelId, resolution, duration, speed, generateAudio }) {
+  return [modelId, resolution, duration, speed, generateAudio ? 1 : 0].join("|");
+}
+
+function getHpPrices() {
+  return getSettings().hpPrices || {};
+}
+
+// Ghi giá học được cho 1 combo (chỉ ghi khi chưa có, tránh update thừa mỗi job).
+function learnHpPrice(combo, hpCost) {
+  const cost = Number(hpCost);
+  if (!Number.isFinite(cost) || cost <= 0) return;
+  const s = getSettings();
+  const prices = s.hpPrices || {};
+  const key = hpPriceKey(combo);
+  if (prices[key] === cost) return; // đã đúng, khỏi ghi
+  prices[key] = cost;
+  s.hpPrices = prices;
+  saveSettings(s);
+}
+
 module.exports = {
   getSettings, saveSettings, mergeSettings, toClientSafe,
   getModelPromptConfig, getVideoApiConfig, getSheetConfig, saveSheetTokens,
+  hpPriceKey, getHpPrices, learnHpPrice,
 };
