@@ -3,8 +3,6 @@ import { setToken } from "./api";
 import Login from "./Login";
 import Users from "./Users";
 import ApiConfig from "./Settings";
-import Scenario from "./Scenario";
-import PromptGen from "./PromptGen";
 import Video from "./Video";
 import Logs from "./Logs";
 
@@ -22,16 +20,9 @@ const ADMIN_NAV = [
 
 export default function App() {
   const [user, setUser] = useState(null);
-  const [tab, setTab] = useState("scenario");
-  // Vùng bàn giao prompt sang module Tạo video (hợp đồng dữ liệu: { projectId, projectName, prompts[] }).
-  const [videoPayload, setVideoPayload] = useState(null);
+  const [tab, setTab] = useState("video");
 
-  function startVideo(payload) {
-    setVideoPayload(payload);
-    setTab("video");
-  }
-
-  if (!user) return <Login onLogin={(u) => { setUser(u); setTab("scenario"); }} />;
+  if (!user) return <Login onLogin={(u) => { setUser(u); setTab("video"); }} />;
 
   const isAdmin = user.role === "admin";
 
@@ -65,9 +56,9 @@ export default function App() {
 
       <div className="main">
         {/* Keep every tab mounted; toggle with CSS so in-progress form data survives tab switches. */}
-        <Tab show={tab === "scenario"}><Scenario onStartVideo={startVideo} /></Tab>
-        <Tab show={tab === "promptgen"}><PromptGen onStartVideo={startVideo} /></Tab>
-        <Tab show={tab === "video"}><Video payload={videoPayload} /></Tab>
+        <Tab show={tab === "scenario"}><ComingSoon title="Tạo kịch bản" /></Tab>
+        <Tab show={tab === "promptgen"}><ComingSoon title="Tạo Prompt" /></Tab>
+        <Tab show={tab === "video"}><Video /></Tab>
         <Tab show={tab === "logs"}><Logs /></Tab>
         {isAdmin && <Tab show={tab === "users"}><Users /></Tab>}
         {isAdmin && <Tab show={tab === "apiconfig"}><ApiConfig /></Tab>}
@@ -78,4 +69,15 @@ export default function App() {
 
 const Tab = ({ show, children }) => (
   <div style={{ display: show ? "block" : "none" }}>{children}</div>
+);
+
+// Module đang phát triển: ẩn nội dung, chỉ báo trạng thái.
+const ComingSoon = ({ title }) => (
+  <div>
+    <h1>{title}</h1>
+    <div className="card" style={{ textAlign: "center", padding: 40 }}>
+      <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>Tính năng đang phát triển</div>
+      <div className="muted">Module này sẽ sớm ra mắt.</div>
+    </div>
+  </div>
 );

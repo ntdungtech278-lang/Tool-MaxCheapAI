@@ -75,6 +75,36 @@ db.exec(`
   );
 `);
 
+// Dự án RIÊNG cho module Tạo video (tách khỏi projects của Tạo kịch bản).
+// Video đã tạo được gom theo video_project để user xem lại/quản lý.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS video_projects (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
+// Migrate: gắn video_jobs với video_project (nullable để dữ liệu cũ vẫn hợp lệ).
+if (!db.prepare("PRAGMA table_info(video_jobs)").all().some((c) => c.name === "project_id")) {
+  db.exec("ALTER TABLE video_jobs ADD COLUMN project_id INTEGER REFERENCES video_projects(id) ON DELETE CASCADE");
+}
+
+// Migrate: tên lượt (batch) do user đặt — dùng để đặt tên file video khi tải.
+if (!db.prepare("PRAGMA table_info(video_jobs)").all().some((c) => c.name === "batch_name")) {
+  db.exec("ALTER TABLE video_jobs ADD COLUMN batch_name TEXT NOT NULL DEFAULT ''");
+}
+
+// Migrate: tạo lại video (revise). parent_job_id trỏ tới video GỐC của chuỗi sửa;
+// version = số bản (gốc = 1, sửa lần 1 = 2, ...). Dùng để đặt tên _v và xếp cạnh gốc.
+if (!db.prepare("PRAGMA table_info(video_jobs)").all().some((c) => c.name === "parent_job_id")) {
+  db.exec("ALTER TABLE video_jobs ADD COLUMN parent_job_id INTEGER DEFAULT NULL");
+}
+if (!db.prepare("PRAGMA table_info(video_jobs)").all().some((c) => c.name === "version")) {
+  db.exec("ALTER TABLE video_jobs ADD COLUMN version INTEGER NOT NULL DEFAULT 1");
+}
+
 // Migrate: thêm cột seconds cho scenarios (thời lượng video, giây).
 if (!db.prepare("PRAGMA table_info(scenarios)").all().some((c) => c.name === "seconds")) {
   db.exec("ALTER TABLE scenarios ADD COLUMN seconds INTEGER NOT NULL DEFAULT 8");

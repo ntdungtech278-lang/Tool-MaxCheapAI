@@ -5,21 +5,21 @@
 const MAXCHEAP_MODELS = {
   "veo-3.1": {
     resolution: ["720p", "1080p", "4k"],
-    durationRange: [3, 15],
+    duration: [4, 6, 8],
     aspectRatio: ["16:9", "9:16"],
-    endFrame: true, generateAudio: true,
+    startFrame: true, endFrame: true, generateAudio: true,
   },
   "kling-3": {
-    resolution: ["std", "720p", "pro", "1080p"],
+    resolution: ["std(720p)", "pro(1080p)"],
     durationRange: [3, 15],
     aspectRatio: ["16:9", "9:16", "1:1"],
-    endFrame: true, generateAudio: false, multiShot: true,
+    startFrame: true, endFrame: true, generateAudio: true, multiShot: true,
   },
   "kling-2.6": {
-    resolution: ["std", "720p", "pro", "1080p"],
+    resolution: ["std(720p)", "pro(1080p)"],
     duration: [5, 10],
     aspectRatio: ["16:9", "9:16", "1:1"],
-    endFrame: true, generateAudio: true,
+    startFrame: true, endFrame: true, generateAudio: true,
     // endFrame + generateAudio mutually exclusive (checked below)
     mutuallyExclusive: ["endFrame", "generateAudio"],
   },
@@ -27,13 +27,13 @@ const MAXCHEAP_MODELS = {
     resolution: ["720p", "1080p"],
     durationRange: [4, 12],
     aspectRatio: ["16:9", "9:16", "1:1", "21:9"],
-    endFrame: true, generateAudio: false,
+    startFrame: true, endFrame: true, generateAudio: true,
   },
   "sora-2-pro": {
     resolution: ["720p", "1080p"],
     duration: [4, 8, 12],
     aspectRatio: ["16:9", "9:16"],
-    endFrame: false, generateAudio: false, // startFrame only
+    startFrame: true, endFrame: false, generateAudio: false, // startFrame only, audio always on
   },
 };
 
@@ -57,7 +57,9 @@ function validateMaxcheap(modelId, p) {
     errors.push(`aspectRatio phải là một trong: ${spec.aspectRatio.join(", ")}`);
 
   if (p.endFrame && !spec.endFrame)
-    errors.push(`${modelId} không hỗ trợ endFrame`);
+    errors.push(`${modelId} không hỗ trợ ảnh cuối (endFrame)`);
+  if (p.startFrame && !spec.startFrame)
+    errors.push(`${modelId} không hỗ trợ ảnh đầu (startFrame)`);
 
   if (Array.isArray(spec.mutuallyExclusive)) {
     const [a, b] = spec.mutuallyExclusive;
@@ -81,6 +83,10 @@ if (require.main === module) {
     { prompt: "x", resolution: "720p", duration: 8, aspectRatio: "16:9" }).ok);
   assert.ok(!validateVideoPayload("maxcheapai", "veo-3.1",
     { prompt: "x", resolution: "480p", duration: 8, aspectRatio: "16:9" }).ok);
+  assert.ok(!validateVideoPayload("maxcheapai", "veo-3.1",
+    { prompt: "x", resolution: "720p", duration: 5, aspectRatio: "16:9" }).ok); // 5s không hợp lệ cho veo
+  assert.ok(validateVideoPayload("maxcheapai", "kling-3",
+    { prompt: "x", resolution: "std(720p)", duration: 5 }).ok);                 // resolution mới
   assert.ok(!validateVideoPayload("maxcheapai", "sora-2-pro",
     { prompt: "x", duration: 8, endFrame: { url: "u" } }).ok);
   assert.ok(!validateVideoPayload("maxcheapai", "kling-2.6",

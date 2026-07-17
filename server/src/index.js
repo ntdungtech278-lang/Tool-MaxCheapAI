@@ -9,6 +9,8 @@ const { buildIdeaSystem, buildPromptSeriesSystem, buildPromptSeriesUser, splitPr
 const { getVideoEffectSystemPrompt, listEffects, DEFAULT_EFFECT } = require("./videoEffects");
 const cfgSvc = require("./configService");
 const queue = require("./queueService");
+const maxcheapai = require("./maxcheapai");
+const googleSheets = require("./googleSheets");
 const { validateVideoPayload } = require("./videoValidate");
 const crypto = require("crypto");
 
@@ -16,7 +18,7 @@ const DEBUG = process.env.DEBUG_API === "1";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "20mb" })); // đủ cho ảnh đầu/cuối gửi dạng base64
 
 const publicUser = (u) => ({
   id: u.id, username: u.username, full_name: u.full_name,
@@ -185,6 +187,198 @@ app.get("/api/projects/:id/scenarios", authRequired, (req, res) => {
   res.json(db.prepare("SELECT * FROM scenarios WHERE project_id=? ORDER BY id DESC").all(req.params.id));
 });
 
+// ---- Video projects: dự án riêng của module Tạo video ----
+function ownedVideoProject(user, id) {
+  const p = db.prepare("SELECT * FROM video_projects WHERE id=?").get(id);
+  if (!p) return null;
+  if (user.role !== "admin" && p.user_id !== user.id) return null;
+  return p;
+}
+
+app.get("/api/video-projects", authRequired, (req, res) => {
+  const rows = req.user.role === "admin"
+    ? db.prepare(`SELECT vp.*, u.username AS owner FROM video_projects vp JOIN users u ON u.id=vp.user_id ORDER BY vp.id DESC`).all()
+    : db.prepare(`SELECT vp.*, u.username AS owner FROM video_projects vp JOIN users u ON u.id=vp.user_id WHERE vp.user_id=? ORDER BY vp.id DESC`).all(req.user.id);
+  res.json(rows);
+});
+
+app.post("/api/video-projects", authRequired, (req, res) => {
+  const name = (req.body?.name || "").trim();
+  if (!name) return res.status(400).json({ error: "Thiếu tên dự án" });
+  const info = db.prepare("INSERT INTO video_projects (user_id, name) VALUES (?, ?)").run(req.user.id, name);
+  log(req.user.id, "create_video_project", name);
+  res.json(db.prepare("SELECT * FROM video_projects WHERE id=?").get(info.lastInsertRowid));
+});
+
+app.delete("/api/video-projects/:id", authRequired, (req, res) => {
+  const p = ownedVideoProject(req.user, req.params.id);
+  if (!p) return res.status(403).json({ error: "Không có quyền" });
+  db.prepare("DELETE FROM video_projects WHERE id=?").run(p.id); // CASCADE xóa video_jobs của dự án
+  log(req.user.id, "delete_video_project", p.name);
+  res.json({ ok: true });
+});
+
+// Mọi video (job) của 1 dự án, gom theo batch để hiển thị từng lượt tạo.
+app.get("/api/video-projects/:id/batches", authRequired, (req, res) => {
+  if (!ownedVideoProject(req.user, req.params.id)) return res.status(403).json({ error: "Không có quyền" });
+  const rows = db.prepare("SELECT * FROM video_jobs WHERE project_id=? ORDER BY id").all(req.params.id);
+  const byBatch = new Map();
+  for (const j of rows) {
+    let p = {}; try { p = JSON.parse(j.payload || "{}"); } catch {}
+    const job = {
+      id: j.id, promptId: j.prompt_id, attemptIndex: j.attempt_index, status: j.status,
+      requestId: j.request_id, resultVideoUrl: j.result_url, thumbnailUrl: j.thumbnail_url,
+      errorMessage: j.error_message, updatedAt: j.updated_at, createdAt: j.created_at,
+      modelId: j.model_id, resolution: p.resolution, aspectRatio: p.aspectRatio, speed: p.speed, duration: p.duration,
+      // Thông tin để tạo lại (revise) + hiển thị panel chi tiết.
+      promptText: j.prompt_text, generateAudio: !!p.generateAudio,
+      startFrame: p.startFrame || null, endFrame: p.endFrame || null,
+      parentJobId: j.parent_job_id || null, version: j.version || 1,
+    };
+    if (!byBatch.has(j.batch_id)) byBatch.set(j.batch_id, { name: j.batch_name || "", jobs: [] });
+    byBatch.get(j.batch_id).jobs.push(job);
+  }
+  const batches = [...byBatch.entries()].map(([batchId, { name, jobs }]) => {
+    const count = (s) => jobs.filter((x) => x.status === s).length;
+    return { batchId, batchName: name, total: jobs.length, jobs, success: count("success"), failed: count("failed"),
+      processing: jobs.filter((x) => ["submitting", "processing", "queued"].includes(x.status)).length,
+      createdAt: jobs[0]?.createdAt };
+  });
+  res.json({ batches });
+});
+
+// Tạo lại 1 video (revise): cùng lượt/prompt với video gốc, đặt cạnh nó, đánh version _v tăng dần.
+// Body: { overrides:{model options}, prompt?, startFrame?, endFrame? }
+app.post("/api/video-jobs/:id/revise", authRequired, async (req, res) => {
+  const src = db.prepare("SELECT * FROM video_jobs WHERE id=?").get(req.params.id);
+  if (!src) return res.status(404).json({ error: "Không tìm thấy video" });
+  if (!src.project_id || !ownedVideoProject(req.user, src.project_id))
+    return res.status(403).json({ error: "Không có quyền" });
+
+  const { provider, cfg } = cfgSvc.getVideoApiConfig();
+  if (!cfg?.apiKey) return res.status(400).json({ error: "Thiếu API key MaxCheapAI" });
+
+  // Chuỗi sửa quy về GỐC (root = job không có parent). version kế tiếp = max trong chuỗi + 1.
+  const rootId = src.parent_job_id || src.id;
+  const maxV = db.prepare("SELECT MAX(version) v FROM video_jobs WHERE id=? OR parent_job_id=?").get(rootId, rootId).v || 1;
+  const version = maxV + 1;
+
+  const o = req.body?.overrides || {};
+  let base = {}; try { base = JSON.parse(src.payload || "{}"); } catch {}
+  const pick = (a, b) => (a === undefined || a === "" || a === null ? b : a);
+  const modelId = pick(o.modelId, src.model_id);
+  const prompt = String(req.body?.prompt ?? src.prompt_text ?? "").trim();
+  const payload = {
+    modelId,
+    resolution: pick(o.resolution, base.resolution),
+    duration: pick(o.duration, base.duration),
+    speed: pick(o.speed, base.speed),
+    aspectRatio: pick(o.aspectRatio, base.aspectRatio),
+    generateAudio: o.generateAudio ?? base.generateAudio ?? false,
+    prompt,
+  };
+  // Ảnh đầu/cuối: dùng giá trị mới nếu client gửi (kể cả null để xóa), else giữ của bản gốc.
+  const sf = req.body?.startFrame !== undefined ? req.body.startFrame : base.startFrame;
+  const ef = req.body?.endFrame !== undefined ? req.body.endFrame : base.endFrame;
+  if (sf?.url) payload.startFrame = { url: sf.url };
+  if (ef?.url) payload.endFrame = { url: ef.url };
+
+  const v = validateVideoPayload(provider, modelId, payload);
+  if (!v.ok) return res.status(400).json({ error: v.errors.join("; ") });
+
+  const job = queue.buildReviseJob({ src, payload, provider, modelId, parentJobId: rootId, version });
+  queue.runSingleJob(cfg, job);
+  log(req.user.id, "video_revise", `job ${src.id} -> v${version} (${provider}/${modelId})`);
+  res.json({ ok: true, jobId: job.id, version });
+});
+
+// OAuth Google Sheet: trả URL để user đăng nhập + cấp quyền (mở bằng browser).
+app.get("/api/sheet/auth-url", authRequired, adminRequired, (req, res) => {
+  const { clientId, clientSecret } = cfgSvc.getSheetConfig();
+  if (!clientId || !clientSecret)
+    return res.status(400).json({ error: "Chưa nhập OAuth Client ID/Secret (lưu cấu hình trước)" });
+  try {
+    const url = googleSheets.getAuthUrl(clientId, clientSecret);
+    res.json({ url });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Google redirect về đây kèm ?code=... -> đổi lấy refresh token, lưu, trả trang đóng tab.
+// Không dùng authRequired vì Google gọi trực tiếp (không có JWT của app).
+app.get("/api/sheet/callback", async (req, res) => {
+  const code = req.query.code;
+  const err = req.query.error;
+  const done = (msg, ok) => res.send(
+    `<html><body style="font-family:sans-serif;background:#0f1218;color:#e6e8eb;text-align:center;padding:60px">
+     <h2>${ok ? "✓ Kết nối Google thành công" : "✗ Kết nối thất bại"}</h2>
+     <p>${msg}</p><p>Bạn có thể đóng tab này và quay lại ứng dụng.</p></body></html>`);
+  if (err) return done(String(err), false);
+  if (!code) return done("Thiếu mã xác thực.", false);
+  try {
+    const { clientId, clientSecret } = cfgSvc.getSheetConfig();
+    const tokens = await googleSheets.exchangeCode(clientId, clientSecret, code);
+    if (!tokens.refresh_token)
+      return done("Không nhận được refresh token. Hãy thử lại (đảm bảo prompt=consent).", false);
+    // Lấy email tài khoản để hiển thị trạng thái.
+    let email = "";
+    try {
+      const oauth = googleSheets.clientFromRefresh(clientId, clientSecret, tokens.refresh_token);
+      const oauth2 = require("googleapis").google.oauth2({ version: "v2", auth: oauth });
+      const me = await oauth2.userinfo.get();
+      email = me.data.email || "";
+    } catch {}
+    cfgSvc.saveSheetTokens({ refreshToken: tokens.refresh_token, connectedEmail: email });
+    done(email ? `Đã kết nối: ${email}` : "Đã lưu quyền truy cập.", true);
+  } catch (e) {
+    done(`Lỗi: ${e.message}`, false);
+  }
+});
+
+// Xuất prompt + ảnh đầu/cuối ra Google Sheet. Body: { title, items:[{prompt,startUrl,endUrl}] }.
+app.post("/api/export-sheet", authRequired, async (req, res) => {
+  const { title, items } = req.body || {};
+  if (!Array.isArray(items) || items.length === 0)
+    return res.status(400).json({ error: "Không có nội dung để xuất" });
+  const { clientId, clientSecret, refreshToken, folderId } = cfgSvc.getSheetConfig();
+  if (!clientId || !clientSecret) return res.status(400).json({ error: "Chưa cấu hình OAuth Google Sheet (Cấu hình API)" });
+  if (!refreshToken) return res.status(400).json({ error: "Chưa kết nối Google. Vào Cấu hình API bấm 'Kết nối Google'." });
+  try {
+    const auth = googleSheets.clientFromRefresh(clientId, clientSecret, refreshToken);
+    const r = await googleSheets.exportPromptsSheet({ auth, title, items, folderId });
+    log(req.user.id, "export_sheet", `${items.length} rows -> ${r.spreadsheetId}`);
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ error: `Lỗi xuất Sheet: ${e.message}` });
+  }
+});
+
+// Reload 1 video LỖI: tạo bản mới cùng lượt/prompt (payload cũ), đẩy vào CUỐI hàng đợi.
+// Job mới hiện trạng thái "Chờ" như video khác, tôn trọng concurrency.
+app.post("/api/video-jobs/:id/retry", authRequired, (req, res) => {
+  const src = db.prepare("SELECT * FROM video_jobs WHERE id=?").get(req.params.id);
+  if (!src) return res.status(404).json({ error: "Không tìm thấy video" });
+  if (!src.project_id || !ownedVideoProject(req.user, src.project_id))
+    return res.status(403).json({ error: "Không có quyền" });
+  const { provider, cfg, videoApi } = cfgSvc.getVideoApiConfig();
+  if (!cfg?.apiKey) return res.status(400).json({ error: "Thiếu API key MaxCheapAI" });
+
+  const job = queue.buildRetryJob(src);
+  queue.enqueueJob(src.batch_id, req.user.id, cfg, job, videoApi?.concurrency || 2);
+  log(req.user.id, "video_retry", `job ${src.id} -> ${job.id}`);
+  res.json({ ok: true, jobId: job.id });
+});
+
+// Xóa vĩnh viễn 1 video (job) khỏi dự án. (Video kết quả nằm ở MaxCheapAI; đây xóa bản ghi + khỏi UI.)
+app.delete("/api/video-jobs/:id", authRequired, (req, res) => {
+  const j = db.prepare("SELECT * FROM video_jobs WHERE id=?").get(req.params.id);
+  if (!j) return res.status(404).json({ error: "Không tìm thấy video" });
+  if (!j.project_id || !ownedVideoProject(req.user, j.project_id))
+    return res.status(403).json({ error: "Không có quyền" });
+  db.prepare("DELETE FROM video_jobs WHERE id=?").run(j.id);
+  log(req.user.id, "video_delete", `job ${j.id}`);
+  res.json({ ok: true });
+});
+
 // ---- Prompt generation: mỗi ý tưởng (tách bởi \n\n) -> 1 prompt, giữ thứ tự ----
 app.post("/api/projects/:id/scenarios", authRequired, async (req, res) => {
   const project = ownedProject(req.user, req.params.id);
@@ -277,11 +471,15 @@ app.put("/api/scenarios/:id", authRequired, (req, res) => {
 });
 
 // ---- Video jobs: build queue from prompts + run against MaxCheapAI ----
-// Body: { prompts: [{ id, promptText, videoCount }], overrides?: {...model options} }
+// Body: { projectId, prompts: [{ id, promptText, videoCount }], overrides?: {...model options} }
 app.post("/api/video-jobs", authRequired, async (req, res) => {
-  const { prompts, overrides } = req.body || {};
+  const { prompts, overrides, projectId, batchName } = req.body || {};
   if (!Array.isArray(prompts) || prompts.length === 0)
     return res.status(400).json({ error: "Thiếu danh sách prompt" });
+
+  // Video luôn gắn 1 dự án video để lưu trữ/xem lại theo dự án.
+  if (!projectId || !ownedVideoProject(req.user, projectId))
+    return res.status(400).json({ error: "Thiếu dự án video hợp lệ" });
 
   const { provider, cfg, videoApi } = cfgSvc.getVideoApiConfig();
   if (!cfg?.apiKey) return res.status(400).json({ error: "Thiếu API key cho video provider trong Cấu hình API" });
@@ -300,14 +498,18 @@ app.post("/api/video-jobs", authRequired, async (req, res) => {
     aspectRatio: pick(o.aspectRatio, cfg.aspectRatio),
     generateAudio: o.generateAudio ?? cfg.generateAudio ?? false, // boolean: giữ false hợp lệ
   };
-  if (o.startFrame) basePayload.startFrame = o.startFrame;
-  if (o.endFrame) basePayload.endFrame = o.endFrame;
+  // startFrame/endFrame giờ theo TỪNG prompt (mỗi hàng có ảnh riêng), không phải override chung.
 
   const concurrency = Math.min(4, Math.max(1, parseInt(o.concurrency, 10) || videoApi.concurrency || 2));
 
-  // Validate one representative payload up front (fail fast, save HP).
-  const v = validateVideoPayload(provider, modelId, { ...basePayload, prompt: prompts[0].promptText });
-  if (!v.ok) return res.status(400).json({ error: v.errors.join("; ") });
+  // Validate mọi prompt (kèm frame của nó) up front (fail fast, save HP).
+  for (const p of prompts) {
+    const test = { ...basePayload, prompt: p.promptText };
+    if (p.startFrame?.url) test.startFrame = p.startFrame;
+    if (p.endFrame?.url) test.endFrame = p.endFrame;
+    const v = validateVideoPayload(provider, modelId, test);
+    if (!v.ok) return res.status(400).json({ error: v.errors.join("; ") });
+  }
 
   // Nhớ lựa chọn: lưu lại config video (các ô ở tab Tạo video) để lần sau khởi tạo đúng.
   if (overrides) {
@@ -320,9 +522,9 @@ app.post("/api/video-jobs", authRequired, async (req, res) => {
   }
 
   const batchId = crypto.randomUUID();
-  const jobs = queue.buildJobsFromPrompts(req.user.id, batchId, prompts, provider, modelId, basePayload);
+  const jobs = queue.buildJobsFromPrompts(req.user.id, batchId, prompts, provider, modelId, basePayload, projectId, String(batchName || "").trim());
   queue.startBatch({ userId: req.user.id, batchId, cfg, jobs, concurrency });
-  log(req.user.id, "video_batch_start", `${jobs.length} jobs @ ${provider}/${modelId}`);
+  log(req.user.id, "video_batch_start", `${jobs.length} jobs @ ${provider}/${modelId} (project ${projectId})`);
   res.json({ batchId, total: jobs.length });
 });
 
@@ -341,6 +543,24 @@ app.get("/api/video-jobs/:batchId", authRequired, (req, res) => {
   res.json({ batchId: req.params.batchId, total: jobs.length, jobs,
     success: count("success"), failed: count("failed"),
     processing: jobs.filter((j) => ["submitting", "processing", "queued"].includes(j.status)).length });
+});
+
+// Upload 1 ảnh (đầu/cuối) -> MaxCheapAI, trả { url }. Client gửi base64 (dataUrl) để
+// tránh thêm multer; ảnh nhỏ nên JSON đủ. URL này dùng làm startFrame/endFrame.
+app.post("/api/upload/image", authRequired, async (req, res) => {
+  const { dataUrl, filename } = req.body || {};
+  const m = /^data:(image\/[\w.+-]+);base64,(.+)$/.exec(String(dataUrl || ""));
+  if (!m) return res.status(400).json({ error: "Ảnh không hợp lệ (cần dataUrl base64)" });
+  const { provider, cfg } = cfgSvc.getVideoApiConfig();
+  if (provider !== "maxcheapai") return res.status(400).json({ error: "Chỉ hỗ trợ upload ảnh cho MaxCheapAI" });
+  if (!cfg?.apiKey) return res.status(400).json({ error: "Thiếu API key MaxCheapAI" });
+  try {
+    const buf = Buffer.from(m[2], "base64");
+    const r = await maxcheapai.uploadImage(cfg, buf, filename || "frame.png", m[1]);
+    res.json({ url: r.imageUrl, width: r.width, height: r.height });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
 });
 
 app.post("/api/video-jobs/:batchId/pause", authRequired, (req, res) => { queue.pauseBatch(req.params.batchId); res.json({ ok: true }); });

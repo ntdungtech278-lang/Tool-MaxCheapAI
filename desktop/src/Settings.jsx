@@ -25,6 +25,7 @@ function normalizeSettings(raw) {
     concurrency: va.concurrency || 2,
     providers: { ...(va.providers || {}), maxcheapai: { ...DEFAULT_MAXCHEAP, ...(va.providers?.maxcheapai || {}) } },
   };
+  s.sheetApi = { clientId: "", clientSecret: "", hasSecret: false, connected: false, connectedEmail: "", folderId: "", ...(s.sheetApi || {}) };
   return s;
 }
 
@@ -39,6 +40,7 @@ export default function ApiConfig() {
   const [probe, setProbe] = useState({});   // { [providerKey]: { ok, message, models } }
   const [probing, setProbing] = useState({});// { [providerKey]: bool }
   const [toast, setToast] = useState("");    // box thông báo nổi khi test key thất bại
+  const [connecting, setConnecting] = useState(false);
 
   useEffect(() => {
     api.getSettings().then((d) => setS(normalizeSettings(d))).catch((e) => setErr(e.message));
@@ -110,6 +112,28 @@ export default function ApiConfig() {
   }
 
   const keyPlaceholder = (prov) => (prov.hasKey ? `Đã lưu: ${prov.apiKeyMask} — nhập để đổi` : "Nhập API key");
+
+  // Kết nối Google: lưu Client ID/Secret trước, lấy URL đăng nhập, mở browser, rồi làm mới trạng thái.
+  async function connectGoogle() {
+    setErr(""); setMsg("");
+    if (!s.sheetApi.clientId || (!s.sheetApi.clientSecret && !s.sheetApi.hasSecret)) {
+      setErr("Nhập OAuth Client ID và Client Secret trước.");
+      return;
+    }
+    setConnecting(true);
+    try {
+      await api.saveSettings(s);               // đảm bảo server có client id/secret mới nhất
+      const { url } = await api.sheetAuthUrl();
+      if (window.desktop?.openExternal) window.desktop.openExternal(url);
+      else window.open(url, "_blank");
+      // Chờ user hoàn tất trên browser rồi làm mới trạng thái kết nối.
+      setMsg("Đã mở trình duyệt. Sau khi cấp quyền xong, bấm 'Làm mới trạng thái' hoặc lưu lại.");
+    } catch (e) { setErr(e.message); }
+    finally { setConnecting(false); }
+  }
+  async function refreshStatus() {
+    try { const d = await api.getSettings(); setS(normalizeSettings(d)); } catch (e) { setErr(e.message); }
+  }
 
   return (
     <div>
@@ -242,6 +266,43 @@ export default function ApiConfig() {
               onChange={(e) => setS({ ...s, veo3: { ...s.veo3, model: e.target.value } })} />
           </div>
         </div>
+      </div>
+
+      {/* ---- API Google Sheet (OAuth) ---- */}
+      <div className="card">
+        <h2 style={{ marginTop: 0 }}>API Google Sheet (OAuth)</h2>
+        <p className="muted">Đăng nhập Google để xuất prompt ra Sheet bằng chính tài khoản của bạn (sheet nằm trong Drive của bạn).</p>
+        <div className="row">
+          <div>
+            <label>OAuth Client ID</label>
+            <input value={s.sheetApi.clientId || ""}
+              onChange={(e) => setS({ ...s, sheetApi: { ...s.sheetApi, clientId: e.target.value.trim() } })}
+              placeholder="xxxxx.apps.googleusercontent.com" />
+          </div>
+          <div>
+            <label>OAuth Client Secret</label>
+            <input type="password" value={s.sheetApi.clientSecret || ""}
+              onChange={(e) => setS({ ...s, sheetApi: { ...s.sheetApi, clientSecret: e.target.value } })}
+              placeholder={s.sheetApi.hasSecret ? "Đã lưu — nhập để đổi" : "GOCSPX-..."} />
+          </div>
+        </div>
+        <label style={{ marginTop: 10 }}>Folder ID trên Google Drive (tùy chọn — để gom sheet vào 1 thư mục)</label>
+        <input value={s.sheetApi.folderId || ""}
+          onChange={(e) => setS({ ...s, sheetApi: { ...s.sheetApi, folderId: e.target.value.trim() } })}
+          placeholder="Phần sau /folders/ trong URL (bỏ trống = lưu ở Drive gốc)" />
+
+        <div className="toolbar" style={{ marginTop: 12, marginBottom: 0 }}>
+          <button className="secondary" onClick={connectGoogle} disabled={connecting}>
+            {connecting ? "Đang mở Google..." : (s.sheetApi.connected ? "Kết nối lại Google" : "Kết nối Google")}
+          </button>
+          <button className="secondary" onClick={refreshStatus}>Làm mới trạng thái</button>
+          {s.sheetApi.connected
+            ? <span style={{ color: "#4ade80" }}>✓ Đã kết nối{s.sheetApi.connectedEmail ? `: ${s.sheetApi.connectedEmail}` : ""}</span>
+            : <span className="muted">Chưa kết nối</span>}
+        </div>
+        <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
+          Bấm "Kết nối Google" mở trình duyệt để đăng nhập + cấp quyền. Redirect URI trong OAuth Client phải có <code>http://localhost:4000/api/sheet/callback</code>. Lưu cấu hình (Client ID/Secret) trước khi kết nối.
+        </p>
       </div>
 
       <button onClick={save}>Lưu cấu hình</button>

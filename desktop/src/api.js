@@ -48,12 +48,24 @@ export const api = {
   testModelPrompt: (provider, cfg) => req("POST", "/model-prompt/test", { provider, cfg }),
   testVideoApi: (provider) => req("POST", "/video-api/test", { provider }),
 
+  // Video projects (dự án riêng của module Tạo video).
+  videoProjects: () => req("GET", "/video-projects"),
+  createVideoProject: (name) => req("POST", "/video-projects", { name }),
+  deleteVideoProject: (id) => req("DELETE", `/video-projects/${id}`),
+  projectVideoBatches: (id) => req("GET", `/video-projects/${id}/batches`),
+
   // Video queue.
   videoModels: () => req("GET", "/video-models"),
-  startVideoJobs: (prompts, overrides) => req("POST", "/video-jobs", { prompts, overrides }),
+  startVideoJobs: (prompts, overrides, projectId, batchName) => req("POST", "/video-jobs", { prompts, overrides, projectId, batchName }),
+  reviseVideo: (jobId, body) => req("POST", `/video-jobs/${jobId}/revise`, body),
+  retryVideo: (jobId) => req("POST", `/video-jobs/${jobId}/retry`),
+  deleteVideoJob: (jobId) => req("DELETE", `/video-jobs/${jobId}`),
   videoBatch: (batchId) => req("GET", `/video-jobs/${batchId}`),
   pauseBatch: (batchId) => req("POST", `/video-jobs/${batchId}/pause`),
   resumeBatch: (batchId) => req("POST", `/video-jobs/${batchId}/resume`),
   cancelBatch: (batchId) => req("POST", `/video-jobs/${batchId}/cancel`),
   downloadVideos: (dir, items) => req("POST", "/download-videos", { dir, items }),
+  uploadImage: (dataUrl, filename) => req("POST", "/upload/image", { dataUrl, filename }),
+  exportSheet: (title, items) => req("POST", "/export-sheet", { title, items }),
+  sheetAuthUrl: () => req("GET", "/sheet/auth-url"),
 };
