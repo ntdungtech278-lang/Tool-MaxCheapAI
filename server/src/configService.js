@@ -18,17 +18,17 @@ function getModelPromptConfig(provider) {
   return { provider: p, cfg: s.providers?.[p], settings: s };
 }
 
-function getVideoApiConfig(provider) {
-  const s = getSettings();
-  const va = s.videoApi || {};
-  const p = provider || va.activeProvider;
-  return { provider: p, cfg: va.providers?.[p], videoApi: va };
+// Provider video duy nhất là Kling. Giữ dạng { provider, cfg, videoApi } để chỗ gọi không đổi.
+const VIDEO_PROVIDER = "kling";
+function getVideoApiConfig() {
+  const va = getSettings().videoApi || {};
+  return { provider: VIDEO_PROVIDER, cfg: va.providers?.[VIDEO_PROVIDER], videoApi: va };
 }
 
 // Merge an incoming settings object from the client WITHOUT letting masked/blank
 // key placeholders wipe stored secrets. If the client sends an empty apiKey, keep
 // the existing one; only overwrite when a real new value is provided.
-const stripMask = ({ apiKeyMask, hasKey, ...rest }) => rest; // drop client-only fields
+const stripMask = ({ apiKeyMask, hasKey, secretKeyMask, hasSecretKey, ...rest }) => rest; // drop client-only fields
 
 function mergeSettings(incoming) {
   const cur = getSettings();
@@ -43,13 +43,6 @@ function mergeSettings(incoming) {
     out.providers[key] = { ...prev, ...val, apiKey };
   }
 
-  // veo3
-  if (incoming.veo3) {
-    const prev = cur.veo3 || {};
-    const v = stripMask(incoming.veo3);
-    out.veo3 = { ...prev, ...v, geminiApiKey: v.geminiApiKey || prev.geminiApiKey };
-  }
-
   // videoApi
   if (incoming.videoApi) {
     const prevVa = cur.videoApi || { providers: {} };
@@ -57,7 +50,10 @@ function mergeSettings(incoming) {
     for (const [key, raw] of Object.entries(incoming.videoApi.providers || {})) {
       const val = stripMask(raw);
       const prev = prevVa.providers?.[key] || {};
-      out.videoApi.providers[key] = { ...prev, ...val, apiKey: val.apiKey ? val.apiKey : prev.apiKey };
+      const merged = { ...prev, ...val, apiKey: val.apiKey ? val.apiKey : prev.apiKey };
+      // Kling có thêm secretKey: cũng "rỗng = giữ cái đã lưu".
+      merged.secretKey = val.secretKey ? val.secretKey : prev.secretKey;
+      out.videoApi.providers[key] = merged;
     }
   }
 
@@ -82,12 +78,10 @@ function toClientSafe(s) {
   for (const p of Object.values(clone.providers || {})) {
     p.apiKeyMask = maskKey(p.apiKey); p.hasKey = !!p.apiKey; p.apiKey = "";
   }
-  if (clone.veo3) {
-    clone.veo3.apiKeyMask = maskKey(clone.veo3.geminiApiKey);
-    clone.veo3.hasKey = !!clone.veo3.geminiApiKey; clone.veo3.geminiApiKey = "";
-  }
   for (const p of Object.values(clone.videoApi?.providers || {})) {
+    // Kling: Access Key nằm ở apiKey, Secret Key tách riêng
     p.apiKeyMask = maskKey(p.apiKey); p.hasKey = !!p.apiKey; p.apiKey = "";
+    p.secretKeyMask = maskKey(p.secretKey); p.hasSecretKey = !!p.secretKey; p.secretKey = "";
   }
   // sheetApi (OAuth): không trả secret/refreshToken ra client; chỉ báo trạng thái.
   if (clone.sheetApi) {
@@ -121,33 +115,7 @@ function saveSheetTokens({ refreshToken, connectedEmail }) {
   saveSettings(s);
 }
 
-// ---- Bảng giá HP tự học ----
-// Provider trả hpCost thực mỗi lần tạo. Ta lưu theo combo (model+setting) để lần sau
-// ước tính TRƯỚC khi bấm. Học 1 lần/combo là đủ (giá cố định theo combo).
-// key = "model|resolution|duration|speed|audio". audio chuẩn hoá về "1"/"0".
-function hpPriceKey({ modelId, resolution, duration, speed, generateAudio }) {
-  return [modelId, resolution, duration, speed, generateAudio ? 1 : 0].join("|");
-}
-
-function getHpPrices() {
-  return getSettings().hpPrices || {};
-}
-
-// Ghi giá học được cho 1 combo (chỉ ghi khi chưa có, tránh update thừa mỗi job).
-function learnHpPrice(combo, hpCost) {
-  const cost = Number(hpCost);
-  if (!Number.isFinite(cost) || cost <= 0) return;
-  const s = getSettings();
-  const prices = s.hpPrices || {};
-  const key = hpPriceKey(combo);
-  if (prices[key] === cost) return; // đã đúng, khỏi ghi
-  prices[key] = cost;
-  s.hpPrices = prices;
-  saveSettings(s);
-}
-
 module.exports = {
   getSettings, saveSettings, mergeSettings, toClientSafe,
   getModelPromptConfig, getVideoApiConfig, getSheetConfig, saveSheetTokens,
-  hpPriceKey, getHpPrices, learnHpPrice,
 };

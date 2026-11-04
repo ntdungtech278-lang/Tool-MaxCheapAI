@@ -9,9 +9,9 @@ const { buildIdeaSystem, buildPromptSeriesSystem, buildPromptSeriesUser, splitPr
 const { getVideoEffectSystemPrompt, listEffects, DEFAULT_EFFECT } = require("./videoEffects");
 const cfgSvc = require("./configService");
 const queue = require("./queueService");
-const maxcheapai = require("./maxcheapai");
+const kling = require("./kling");
 const googleSheets = require("./googleSheets");
-const { validateVideoPayload } = require("./videoValidate");
+const { validateVideoPayload, KLING_MODELS } = require("./videoValidate");
 const crypto = require("crypto");
 
 const DEBUG = process.env.DEBUG_API === "1";
@@ -19,6 +19,9 @@ const DEBUG = process.env.DEBUG_API === "1";
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "20mb" })); // đủ cho ảnh đầu/cuối gửi dạng base64
+// Ảnh đầu/cuối của Kling lưu local (Kling không có endpoint upload); renderer cần xem lại preview.
+// Tên file là UUID ngẫu nhiên, server chỉ nghe localhost nên không cần auth cho thẻ <img>.
+app.use("/uploads", express.static(kling.UPLOAD_DIR));
 
 const publicUser = (u) => ({
   id: u.id, username: u.username, full_name: u.full_name,
@@ -99,52 +102,38 @@ app.post("/api/model-prompt/test", authRequired, adminRequired, async (req, res)
   res.json(result);
 });
 
-// Test the active video provider (MaxCheapAI) by listing generations (cheap, no HP).
+// Test kết nối Kling bằng 1 lệnh liệt kê task (rẻ, không tốn credit).
 app.post("/api/video-api/test", authRequired, adminRequired, async (req, res) => {
-  const { provider } = req.body || {};
-  const { provider: p, cfg } = cfgSvc.getVideoApiConfig(provider);
+  const { cfg } = cfgSvc.getVideoApiConfig();
   try {
-    if (!cfg?.apiKey) throw new Error("Thiếu API key cho MaxCheapAI");
-    const maxcheapai = require("./maxcheapai");
-    await maxcheapai.listVideoGenerations(cfg, 1);
-    res.json({ ok: true, status: 200, message: "OK", endpoint: `${cfg.baseUrl}/video-generations` });
+    if (!kling.hasCreds(cfg)) throw new Error(`Thiếu ${kling.CREDS_HINT}`);
+    await kling.listVideoGenerations(cfg, 1);
+    res.json({ ok: true, status: 200, message: "OK", endpoint: `${cfg.baseUrl}/v1/videos/text2video` });
   } catch (e) {
-    res.json({ ok: false, status: e.status || 0, message: e.message, endpoint: p });
+    res.json({ ok: false, status: e.status || 0, message: e.message, endpoint: "kling" });
   }
 });
 
-// MaxCheapAI model list + saved video settings, for the "Tạo video" tab controls.
+// Model Kling + cấu hình video đã lưu (không kèm key), để tab "Tạo video" khởi tạo các ô chọn.
 app.get("/api/video-models", authRequired, (req, res) => {
-  const { MAXCHEAP_MODELS } = require("./videoValidate");
   const { cfg, videoApi } = cfgSvc.getVideoApiConfig();
+  const models = Object.keys(KLING_MODELS);
+  const modelId = models.includes(cfg?.modelId) ? cfg.modelId : models[0];
+  const first = KLING_MODELS[modelId];
   res.json({
-    models: Object.keys(MAXCHEAP_MODELS),
-    defaultModelId: cfg?.modelId || "veo-3.1",
-    // Cấu hình video đã lưu (không kèm key) để tab Tạo video khởi tạo các ô chọn.
+    models,
+    defaultModelId: modelId,
     settings: {
-      modelId: cfg?.modelId || "veo-3.1",
-      speed: cfg?.speed ?? "normal",
-      resolution: cfg?.resolution ?? "720p",
-      duration: cfg?.duration ?? 8,
-      aspectRatio: cfg?.aspectRatio ?? "16:9",
+      modelId,
+      resolution: cfg?.resolution ?? first.resolution[0],
+      duration: cfg?.duration ?? first.duration?.[0] ?? first.durationRange[0],
+      aspectRatio: cfg?.aspectRatio ?? first.aspectRatio[0],
       generateAudio: cfg?.generateAudio ?? false,
+      negativePrompt: cfg?.negativePrompt ?? "",
+      cfgScale: cfg?.cfgScale ?? "",
       concurrency: videoApi?.concurrency ?? 2,
     },
   });
-});
-
-// Số dư HP (credit) của tài khoản MaxCheapAI + bảng giá HP đã học (để ước tính trước khi tạo).
-// Balance lấy trực tiếp từ provider GET /hp; prices là bảng tự học server-side.
-app.get("/api/hp", authRequired, async (req, res) => {
-  const { cfg } = cfgSvc.getVideoApiConfig();
-  const prices = cfgSvc.getHpPrices();
-  if (!cfg?.apiKey) return res.json({ balance: null, prices, error: "Chưa cấu hình API key video" });
-  try {
-    const hp = await maxcheapai.getHpBalance(cfg);
-    res.json({ balance: hp.totalHp ?? null, freeHp: hp.freeHp ?? null, paidHp: hp.paidHp ?? null, prices });
-  } catch (e) {
-    res.json({ balance: null, prices, error: e.message });
-  }
 });
 
 // Which prompt model is active (any logged-in user may read, keys stripped).
@@ -243,7 +232,7 @@ app.get("/api/video-projects/:id/batches", authRequired, (req, res) => {
       id: j.id, promptId: j.prompt_id, attemptIndex: j.attempt_index, status: j.status,
       requestId: j.request_id, resultVideoUrl: j.result_url, thumbnailUrl: j.thumbnail_url,
       errorMessage: j.error_message, updatedAt: j.updated_at, createdAt: j.created_at,
-      modelId: j.model_id, resolution: p.resolution, aspectRatio: p.aspectRatio, speed: p.speed, duration: p.duration,
+      modelId: j.model_id, provider: j.provider, resolution: p.resolution, aspectRatio: p.aspectRatio, duration: p.duration,
       // Thông tin để tạo lại (revise) + hiển thị panel chi tiết.
       promptText: j.prompt_text, generateAudio: !!p.generateAudio,
       startFrame: p.startFrame || null, endFrame: p.endFrame || null,
@@ -271,8 +260,11 @@ app.post("/api/video-jobs/:id/revise", authRequired, async (req, res) => {
   if (!src.project_id || !ownedVideoProject(req.user, src.project_id))
     return res.status(403).json({ error: "Không có quyền" });
 
+  // Video tạo bằng provider cũ (đã gỡ) thì model gốc không còn -> không tạo lại được.
+  if (src.provider !== "kling")
+    return res.status(400).json({ error: "Video này tạo bằng provider cũ đã gỡ, không tạo lại được. Hãy tạo video mới bằng Kling." });
   const { provider, cfg } = cfgSvc.getVideoApiConfig();
-  if (!cfg?.apiKey) return res.status(400).json({ error: "Thiếu API key MaxCheapAI" });
+  if (!kling.hasCreds(cfg)) return res.status(400).json({ error: `Thiếu ${kling.CREDS_HINT}` });
 
   // Chuỗi sửa quy về GỐC (root = job không có parent). version kế tiếp = max trong chuỗi + 1.
   const rootId = src.parent_job_id || src.id;
@@ -288,9 +280,10 @@ app.post("/api/video-jobs/:id/revise", authRequired, async (req, res) => {
     modelId,
     resolution: pick(o.resolution, base.resolution),
     duration: pick(o.duration, base.duration),
-    speed: pick(o.speed, base.speed),
     aspectRatio: pick(o.aspectRatio, base.aspectRatio),
     generateAudio: o.generateAudio ?? base.generateAudio ?? false,
+    negativePrompt: pick(o.negativePrompt, base.negativePrompt),
+    cfgScale: pick(o.cfgScale, base.cfgScale),
     prompt,
     mode: base.mode || "normal", // giữ mode gốc -> tên video bản sửa vẫn theo đúng phòng
   };
@@ -301,7 +294,7 @@ app.post("/api/video-jobs/:id/revise", authRequired, async (req, res) => {
   if (sf?.url) payload.startFrame = { url: sf.url, ...(sf.name ? { name: sf.name } : {}) };
   if (ef?.url) payload.endFrame = { url: ef.url, ...(ef.name ? { name: ef.name } : {}) };
 
-  const v = validateVideoPayload(provider, modelId, payload);
+  const v = validateVideoPayload(modelId, payload);
   if (!v.ok) return res.status(400).json({ error: v.errors.join("; ") });
 
   const job = queue.buildReviseJob({ src, payload, provider, modelId, parentJobId: rootId, version });
@@ -377,8 +370,10 @@ app.post("/api/video-jobs/:id/retry", authRequired, (req, res) => {
   if (!src) return res.status(404).json({ error: "Không tìm thấy video" });
   if (!src.project_id || !ownedVideoProject(req.user, src.project_id))
     return res.status(403).json({ error: "Không có quyền" });
-  const { provider, cfg, videoApi } = cfgSvc.getVideoApiConfig();
-  if (!cfg?.apiKey) return res.status(400).json({ error: "Thiếu API key MaxCheapAI" });
+  if (src.provider !== "kling")
+    return res.status(400).json({ error: "Video này tạo bằng provider cũ đã gỡ, không tạo lại được. Hãy tạo video mới bằng Kling." });
+  const { cfg, videoApi } = cfgSvc.getVideoApiConfig();
+  if (!kling.hasCreds(cfg)) return res.status(400).json({ error: `Thiếu ${kling.CREDS_HINT}` });
 
   const job = queue.buildRetryJob(src);
   queue.enqueueJob(src.batch_id, req.user.id, cfg, job, videoApi?.concurrency || 2);
@@ -386,7 +381,7 @@ app.post("/api/video-jobs/:id/retry", authRequired, (req, res) => {
   res.json({ ok: true, jobId: job.id });
 });
 
-// Xóa vĩnh viễn 1 video (job) khỏi dự án. (Video kết quả nằm ở MaxCheapAI; đây xóa bản ghi + khỏi UI.)
+// Xóa vĩnh viễn 1 video (job) khỏi dự án. (Video kết quả nằm ở Kling; đây xóa bản ghi + khỏi UI.)
 app.delete("/api/video-jobs/:id", authRequired, (req, res) => {
   const j = db.prepare("SELECT * FROM video_jobs WHERE id=?").get(req.params.id);
   if (!j) return res.status(404).json({ error: "Không tìm thấy video" });
@@ -488,7 +483,7 @@ app.put("/api/scenarios/:id", authRequired, (req, res) => {
   res.json(db.prepare("SELECT * FROM scenarios WHERE id=?").get(sc.id));
 });
 
-// ---- Video jobs: build queue from prompts + run against MaxCheapAI ----
+// ---- Video jobs: build queue from prompts + run against Kling ----
 // Body: { projectId, prompts: [{ id, promptText, videoCount }], overrides?: {...model options} }
 app.post("/api/video-jobs", authRequired, async (req, res) => {
   const { prompts, overrides, projectId, batchName, mode } = req.body || {};
@@ -501,11 +496,12 @@ app.post("/api/video-jobs", authRequired, async (req, res) => {
     return res.status(400).json({ error: "Thiếu dự án video hợp lệ" });
 
   const { provider, cfg, videoApi } = cfgSvc.getVideoApiConfig();
-  if (!cfg?.apiKey) return res.status(400).json({ error: "Thiếu API key cho video provider trong Cấu hình API" });
+  if (!kling.hasCreds(cfg))
+    return res.status(400).json({ error: `Thiếu ${kling.CREDS_HINT} trong Cấu hình API` });
 
   // Toàn bộ setting gửi từ tab Tạo video (overrides) là nguồn chính; chỉ dùng
   // config đã lưu để lấp field client không gửi (undefined). Giá trị rỗng "" bị coi
-  // như thiếu để không đẩy payload lỗi xuống provider.
+  // như thiếu để không đẩy payload lỗi xuống Kling.
   const pick = (a, b) => (a === undefined || a === "" || a === null ? b : a);
   const o = overrides || {};
   const modelId = pick(o.modelId, cfg.modelId);
@@ -513,30 +509,32 @@ app.post("/api/video-jobs", authRequired, async (req, res) => {
     modelId,
     resolution: pick(o.resolution, cfg.resolution),
     duration: pick(o.duration, cfg.duration),
-    speed: pick(o.speed, cfg.speed),
     aspectRatio: pick(o.aspectRatio, cfg.aspectRatio),
     generateAudio: o.generateAudio ?? cfg.generateAudio ?? false, // boolean: giữ false hợp lệ
+    negativePrompt: pick(o.negativePrompt, cfg.negativePrompt),
+    cfgScale: pick(o.cfgScale, cfg.cfgScale),
     mode: runMode, // gắn theo TỪNG video: đổi phòng ban sau không đổi tên video đã tạo
   };
   // startFrame/endFrame giờ theo TỪNG prompt (mỗi hàng có ảnh riêng), không phải override chung.
 
   const concurrency = Math.min(4, Math.max(1, parseInt(o.concurrency, 10) || videoApi.concurrency || 2));
 
-  // Validate mọi prompt (kèm frame của nó) up front (fail fast, save HP).
+  // Validate mọi prompt (kèm frame của nó) up front (fail fast, không gửi request chắc chắn lỗi).
   for (const p of prompts) {
     const test = { ...basePayload, prompt: p.promptText };
     if (p.startFrame?.url) test.startFrame = p.startFrame;
     if (p.endFrame?.url) test.endFrame = p.endFrame;
-    const v = validateVideoPayload(provider, modelId, test);
+    const v = validateVideoPayload(modelId, test);
     if (!v.ok) return res.status(400).json({ error: v.errors.join("; ") });
   }
 
   // Nhớ lựa chọn: lưu lại config video (các ô ở tab Tạo video) để lần sau khởi tạo đúng.
   if (overrides) {
     const merged = cfgSvc.mergeSettings({ videoApi: { concurrency,
-      providers: { maxcheapai: {
+      providers: { [provider]: {
         modelId, resolution: basePayload.resolution, duration: basePayload.duration,
-        speed: basePayload.speed, aspectRatio: basePayload.aspectRatio, generateAudio: basePayload.generateAudio,
+        aspectRatio: basePayload.aspectRatio, generateAudio: basePayload.generateAudio,
+        negativePrompt: basePayload.negativePrompt ?? "", cfgScale: basePayload.cfgScale ?? "",
       } } } });
     cfgSvc.saveSettings(merged);
   }
@@ -556,7 +554,7 @@ app.get("/api/video-jobs/:batchId", authRequired, (req, res) => {
       id: j.id, promptId: j.prompt_id, attemptIndex: j.attempt_index, status: j.status,
       requestId: j.request_id, resultVideoUrl: j.result_url, thumbnailUrl: j.thumbnail_url,
       errorMessage: j.error_message, updatedAt: j.updated_at, createdAt: j.created_at,
-      modelId: j.model_id, resolution: p.resolution, aspectRatio: p.aspectRatio, speed: p.speed, duration: p.duration,
+      modelId: j.model_id, provider: j.provider, resolution: p.resolution, aspectRatio: p.aspectRatio, duration: p.duration,
       promptText: j.prompt_text, startFrame: p.startFrame || null, endFrame: p.endFrame || null, // Phòng 3D: đặt tên theo tên ảnh
       mode: p.mode || "normal", // mode lúc tạo video này -> đặt tên ổn định
     };
@@ -569,19 +567,16 @@ app.get("/api/video-jobs/:batchId", authRequired, (req, res) => {
     processing: jobs.filter((j) => ["submitting", "processing", "queued"].includes(j.status)).length });
 });
 
-// Upload 1 ảnh (đầu/cuối) -> MaxCheapAI, trả { url }. Client gửi base64 (dataUrl) để
+// Upload 1 ảnh (đầu/cuối) -> lưu local (Kling không có endpoint upload), trả { url }. Client gửi base64 (dataUrl) để
 // tránh thêm multer; ảnh nhỏ nên JSON đủ. URL này dùng làm startFrame/endFrame.
 app.post("/api/upload/image", authRequired, async (req, res) => {
   const { dataUrl, filename } = req.body || {};
   const m = /^data:(image\/[\w.+-]+);base64,(.+)$/.exec(String(dataUrl || ""));
   if (!m) return res.status(400).json({ error: "Ảnh không hợp lệ (cần dataUrl base64)" });
-  const { provider, cfg } = cfgSvc.getVideoApiConfig();
-  if (provider !== "maxcheapai") return res.status(400).json({ error: "Chỉ hỗ trợ upload ảnh cho MaxCheapAI" });
-  if (!cfg?.apiKey) return res.status(400).json({ error: "Thiếu API key MaxCheapAI" });
   try {
     const buf = Buffer.from(m[2], "base64");
-    const r = await maxcheapai.uploadImage(cfg, buf, filename || "frame.png", m[1]);
-    res.json({ url: r.imageUrl, width: r.width, height: r.height });
+    const r = await kling.uploadImage(buf, filename || "frame.png", m[1]);
+    res.json({ url: r.imageUrl });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   }
@@ -643,7 +638,7 @@ app.get("/api/logs", authRequired, (req, res) => {
 // Sau restart: runner in-memory đã mất. Cứu job dở dang (đã gửi provider -> 'stalled' để
 // đối soát; chưa gửi -> 'failed'), rồi bật reconciler nền đối soát 'stalled' tới khi có kết quả.
 queue.recoverOrphansOnBoot();
-queue.startReconciler(() => cfgSvc.getVideoApiConfig().cfg);
+queue.startReconciler();
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {

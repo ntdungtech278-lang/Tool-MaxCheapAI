@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api } from "./api";
-import { useHp, estimate, optimisticDeduct, refreshHp } from "./hpStore";
+import { api, assetUrl } from "./api";
 import { threeDBaseName } from "./name3d";
 import ConfirmDialog from "./ConfirmDialog";
 
@@ -10,7 +9,7 @@ const DEPARTMENTS = ["Phòng 3D"];
 
 // Module "Tạo video". Mỗi dòng = 1 prompt. Mỗi prompt có ô "số video" -> tạo
 // videoCount job cho prompt đó. Job hiển thị NHÓM THEO PROMPT thành từng hàng
-// (hàng 1 = video của prompt 1, ...). Toàn bộ cấu hình tạo video (model, speed,
+// (hàng 1 = video của prompt 1, ...). Toàn bộ cấu hình tạo video (model,
 // resolution, duration, aspect ratio, concurrency, generate audio) được chọn ngay
 // tại đây; server nhớ lại lựa chọn. Queue chạy server-side theo concurrency đã chọn.
 
@@ -24,23 +23,20 @@ const ST = {
   failed:     { label: "Lỗi",         cls: "off" },
 };
 
-// Per-model UI options (mirrors server validateVideoPayload).
+// Per-model UI options (mirrors KLING_MODELS ở server/src/videoValidate.js).
 // duration: danh sách rời rạc (dropdown) | durationRange: [min,max] (nhập tay).
-// Mỗi model: options + khả năng frame/audio (mirrors server validateVideoPayload + docs MaxCheapAI).
-//  startFrame/endFrame: có hỗ trợ ảnh đầu/cuối. audioForced: audio luôn bật (sora).
-//  audioExclEnd: audio ⊕ endFrame loại trừ nhau (kling-2.6). multiShot: chỉ kling-3.
+// startFrame/endFrame: có hỗ trợ ảnh đầu/cuối. audio: có hỗ trợ sinh âm thanh (Kling `sound`).
 const MODEL_OPTS = {
-  "veo-3.1": { resolution: ["720p", "1080p", "4k"], duration: [4, 6, 8], aspectRatio: ["16:9", "9:16"], audio: true, startFrame: true, endFrame: true },
-  "kling-3": { resolution: ["std(720p)", "pro(1080p)"], durationRange: [3, 15], aspectRatio: ["16:9", "9:16", "1:1"], audio: true, startFrame: true, endFrame: true, multiShot: true },
-  "kling-2.6": { resolution: ["std(720p)", "pro(1080p)"], duration: [5, 10], aspectRatio: ["16:9", "9:16", "1:1"], audio: true, startFrame: true, endFrame: true, audioExclEnd: true },
-  "byte-plus-seedance-1-5": { resolution: ["720p", "1080p"], durationRange: [4, 12], aspectRatio: ["16:9", "9:16", "1:1", "21:9"], audio: true, startFrame: true, endFrame: true },
-  "sora-2-pro": { resolution: ["720p", "1080p"], duration: [4, 8, 12], aspectRatio: ["16:9", "9:16"], audioForced: true, startFrame: true, endFrame: false },
+  "kling-v1-6": { resolution: ["std(720p)", "pro(1080p)"], duration: [5, 10], aspectRatio: ["16:9", "9:16", "1:1"], startFrame: true, endFrame: true },
+  "kling-v2-5-turbo": { resolution: ["std(720p)", "pro(1080p)"], duration: [5, 10], aspectRatio: ["16:9", "9:16", "1:1"], startFrame: true, endFrame: true },
+  "kling-v2-6": { resolution: ["std(720p)", "pro(1080p)"], duration: [5, 10], aspectRatio: ["16:9", "9:16", "1:1"], audio: true, startFrame: true, endFrame: true },
+  "kling-v3": { resolution: ["std(720p)", "pro(1080p)"], durationRange: [3, 15], aspectRatio: ["16:9", "9:16", "1:1"], audio: true, startFrame: true, endFrame: true },
 };
-const SPEEDS = ["slow", "normal", "priority"];
+const DEFAULT_MODEL = "kling-v2-6";
 
 // Ép duration về giá trị hợp lệ cho model (khi đổi model có thể lệch dải/list).
 function clampDuration(modelId, dur) {
-  const o = MODEL_OPTS[modelId] || MODEL_OPTS["veo-3.1"];
+  const o = MODEL_OPTS[modelId] || MODEL_OPTS[DEFAULT_MODEL];
   if (o.durationRange) return Math.min(o.durationRange[1], Math.max(o.durationRange[0], Number(dur) || o.durationRange[0]));
   return o.duration.includes(Number(dur)) ? Number(dur) : o.duration[0];
 }
@@ -164,8 +160,9 @@ function VideoStudio({ project, onBack }) {
   const [promptsCollapsed, setPromptsCollapsed] = useState(false); // thu gọn khu nhập prompt sau khi Tạo
   // Cấu hình tạo video (chuyển từ tab Cấu hình API sang đây). Khởi tạo từ settings đã lưu.
   const [cfg, setCfg] = useState({
-    modelId: "veo-3.1", speed: "normal", resolution: "720p",
-    duration: 8, aspectRatio: "16:9", generateAudio: false, concurrency: 2,
+    modelId: DEFAULT_MODEL, resolution: "std(720p)",
+    duration: 5, aspectRatio: "16:9", generateAudio: false, concurrency: 2,
+    negativePrompt: "", cfgScale: "",
   });
   const [batchId, setBatchId] = useState(null);
   const [batch, setBatch] = useState(null);
@@ -207,9 +204,7 @@ function VideoStudio({ project, onBack }) {
     setCfg((c) => field === "modelId"
       ? { ...c, modelId: value, duration: clampDuration(value, c.duration) }
       : { ...c, [field]: value });
-  const mopts = MODEL_OPTS[cfg.modelId] || MODEL_OPTS["veo-3.1"];
-  // kling-2.6: audio ⊕ endFrame. Nếu có hàng dùng ảnh cuối -> khóa audio để tránh 400.
-  const audioLocked = !!mopts.audioExclEnd && rows.some((r) => r.endFrame?.url);
+  const mopts = MODEL_OPTS[cfg.modelId] || MODEL_OPTS[DEFAULT_MODEL];
   const durErr = mopts.durationRange && cfg.duration !== "" && cfg.duration != null &&
     (Number(cfg.duration) < mopts.durationRange[0] || Number(cfg.duration) > mopts.durationRange[1])
       ? `Thời lượng phải từ ${mopts.durationRange[0]} đến ${mopts.durationRange[1]} giây` : "";
@@ -242,7 +237,6 @@ function VideoStudio({ project, onBack }) {
           setBatch(null);
           setRows([emptyRow()]); setBatchName(""); setBatchId(null); setPaused(false); setPromptsCollapsed(false);
           loadHistory(); // đồng bộ lịch sử dự án từ server (đã lưu batch vừa xong)
-          refreshHp();   // lấy HP thực sau khi xong: provider đã hoàn nếu có job lỗi
         }
       } catch (e) { setErr(e.message); }
     };
@@ -254,12 +248,6 @@ function VideoStudio({ project, onBack }) {
   const validRows = rows.filter((r) => r.prompt.trim());
   const totalJobs = validRows.reduce((n, r) => n + Math.max(1, parseInt(r.videoCount, 10) || 1), 0);
   const anyUploading = rows.some((r) => r.upStart || r.upEnd);
-
-  // audio thực gửi xuống (khớp start()): sora ép tắt override, kling-2.6 khóa khi có ảnh cuối.
-  const effAudio = mopts.audioForced ? false : (audioLocked ? false : cfg.generateAudio);
-  // Ước tính HP: đơn giá học được cho combo model+setting × tổng số video.
-  const hpEst = estimate({ modelId: cfg.modelId, resolution: cfg.resolution,
-    duration: cfg.duration, speed: cfg.speed, generateAudio: effAudio }, totalJobs);
 
   const patchRow = (i, patch) => setRows((rs) => rs.map((r, k) => (k === i ? { ...r, ...patch } : r)));
   const addRow = () => setRows((rs) => [...rs, emptyRow()]);
@@ -302,15 +290,13 @@ function VideoStudio({ project, onBack }) {
         ...(mopts.endFrame && r.endFrame?.url ? { endFrame: { url: r.endFrame.url, name: r.endFrame.name || "" } } : {}),
       }));
       const { batchId: id } = await api.startVideoJobs(items, {
-        modelId: cfg.modelId, speed: cfg.speed, resolution: cfg.resolution,
+        modelId: cfg.modelId, resolution: cfg.resolution,
         duration: cfg.duration, aspectRatio: cfg.aspectRatio,
-        // sora tự bật audio; kling-2.6 khóa audio khi có ảnh cuối.
-        generateAudio: mopts.audioForced ? false : (audioLocked ? false : cfg.generateAudio),
+        generateAudio: !!(mopts.audio && cfg.generateAudio), // model không hỗ trợ audio -> luôn tắt
         concurrency: cfg.concurrency,
+        negativePrompt: cfg.negativePrompt, cfgScale: cfg.cfgScale,
       }, project.id, is3D ? "" : batchName.trim(), is3D ? "3d" : "normal");
       setBatch(null); setBatchId(id); setPaused(false); setDl(null); setPromptsCollapsed(true);
-      if (hpEst.known) optimisticDeduct(hpEst.total); // trừ ngay; số thực đồng bộ sau
-      setTimeout(refreshHp, 8000); // sau khi job submit xong, lấy hpBalance thực + học giá combo mới
     } catch (e) { setErr(e.message); }
   }
   async function pause() { await api.pauseBatch(batchId); setPaused(true); }
@@ -480,15 +466,9 @@ function VideoStudio({ project, onBack }) {
             </select>
           </div>
           <div>
-            <label>Model</label>
+            <label>Model (Kling AI)</label>
             <select value={cfg.modelId} onChange={(e) => setCfgField("modelId", e.target.value)} disabled={!!batchId}>
               {models.map((m) => <option key={m} value={m}>{m}</option>)}
-            </select>
-          </div>
-          <div>
-            <label>Speed</label>
-            <select value={cfg.speed} onChange={(e) => setCfgField("speed", e.target.value)} disabled={!!batchId}>
-              {SPEEDS.map((x) => <option key={x} value={x}>{x}</option>)}
             </select>
           </div>
           <div>
@@ -527,24 +507,29 @@ function VideoStudio({ project, onBack }) {
               placeholder={is3D ? "Phòng 3D: đặt tên theo tên ảnh" : "vd: lan1"}
               onChange={(e) => setBatchName(e.target.value)} />
           </div>
-          {mopts.audioForced ? (
-            <div>
-              <label>Âm thanh</label>
-              <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>Luôn bật (theo model)</div>
-            </div>
-          ) : mopts.audio && (
+          {mopts.audio && (
             <div>
               <label>Generate audio</label>
-              <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, cursor: audioLocked ? "not-allowed" : "pointer" }}>
-                <input type="checkbox" style={{ width: "auto" }} checked={!!cfg.generateAudio && !audioLocked}
-                  disabled={!!batchId || audioLocked}
+              <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, cursor: "pointer" }}>
+                <input type="checkbox" style={{ width: "auto" }} checked={!!cfg.generateAudio}
+                  disabled={!!batchId}
                   onChange={(e) => setCfgField("generateAudio", e.target.checked)} />
                 <span className="muted">Bật âm thanh</span>
               </label>
             </div>
           )}
+          <div>
+            <label>CFG scale (0–1, tùy chọn)</label>
+            <input type="number" min={0} max={1} step={0.1} disabled={!!batchId} placeholder="mặc định"
+              value={cfg.cfgScale ?? ""}
+              onChange={(e) => setCfgField("cfgScale", e.target.value === "" ? "" : Number(e.target.value))} />
+          </div>
+          <div style={{ gridColumn: "1 / -1" }}>
+            <label>Negative prompt (tùy chọn)</label>
+            <input type="text" disabled={!!batchId} maxLength={2500} placeholder="vd: blurry, watermark, text"
+              value={cfg.negativePrompt || ""} onChange={(e) => setCfgField("negativePrompt", e.target.value)} />
+          </div>
         </div>
-        {audioLocked && <div className="field-error">{cfg.modelId}: âm thanh và ảnh cuối không dùng cùng lúc — audio đã tắt vì có ảnh cuối.</div>}
         {durErr && <div className="field-error">{durErr}</div>}
 
         {/* Header: khi thu gọn thì bấm để sổ ra/đóng lại danh sách prompt đã nhập */}
@@ -599,11 +584,6 @@ function VideoStudio({ project, onBack }) {
           <div className="toolbar" style={{ marginTop: 10, marginBottom: 0 }}>
             {!batchId && <button className="secondary" onClick={addRow}>+ Thêm prompt</button>}
             <span className="spacer" />
-            {!batchId && totalJobs > 0 && (
-              <span className="hp-cost" title={hpEst.known ? "HP ước tính sẽ trừ cho lượt này" : "Chưa có giá cho model/thiết lập này — sẽ cập nhật sau lần tạo đầu"}>
-                {hpEst.known ? <>~<b>{hpEst.total.toLocaleString()}</b> HP</> : "HP: chưa cập nhật"}
-              </span>
-            )}
             {!batchId && <button onClick={start} disabled={validRows.length === 0 || anyUploading}>Tạo video ({totalJobs})</button>}
           </div>
         )}
@@ -659,7 +639,8 @@ function VideoStudio({ project, onBack }) {
       )}
 
       {preview && (
-        <PreviewModal job={preview} projectName={project.name} models={models}
+        <PreviewModal job={preview} projectName={project.name}
+          models={models}
           fileNameBase={nameOf(preview)}
           onClose={() => setPreview(null)}
           onDownloadOne={downloadOne}
@@ -704,7 +685,7 @@ function FrameBox({ label, frame, uploading, disabled, hint, onPick, onClear }) 
         <div className="muted"><i className="spin" /> Đang tải…</div>
       ) : frame?.preview ? (
         <>
-          <img src={frame.preview} alt={label} className="frame-img" />
+          <img src={assetUrl(frame.preview)} alt={label} className="frame-img" />
           {!disabled && (
             <button className="frame-clear" title="Xóa ảnh"
               onClick={(e) => { e.stopPropagation(); onClear(); }}>×</button>
@@ -775,7 +756,6 @@ function JobCell({ j, onOpen, marked, onMark, promptNo, fileName, onRetry, onDel
           {j.duration != null && <span>{j.duration}s</span>}
           {j.resolution && <span>{j.resolution}</span>}
           {j.aspectRatio && <span>{j.aspectRatio}</span>}
-          {j.speed && <span>{j.speed}</span>}
           {j.createdAt && <span>{fmtDate(j.createdAt)}</span>}
           <span className="spacer" />
           <label className="mark-check" title="Đánh dấu đạt yêu cầu">
@@ -797,7 +777,7 @@ function PreviewModal({ job, projectName, models, fileNameBase, onClose, onDownl
   const [askDelete, setAskDelete] = useState(false);
   // Cấu hình sửa được, khởi tạo từ chính video đang xem.
   const [f, setF] = useState({
-    modelId: job.modelId, speed: job.speed, resolution: job.resolution,
+    modelId: job.modelId, resolution: job.resolution,
     duration: job.duration, aspectRatio: job.aspectRatio, generateAudio: !!job.generateAudio,
     prompt: job.promptText || "",
   });
@@ -807,10 +787,9 @@ function PreviewModal({ job, projectName, models, fileNameBase, onClose, onDownl
   const [upStart, setUpStart] = useState(false);
   const [upEnd, setUpEnd] = useState(false);
 
-  const mopts = MODEL_OPTS[f.modelId] || MODEL_OPTS["veo-3.1"];
+  const mopts = MODEL_OPTS[f.modelId] || MODEL_OPTS[DEFAULT_MODEL];
   const setField = (k, v) => setF((s) => k === "modelId"
     ? { ...s, modelId: v, duration: clampDuration(v, s.duration) } : { ...s, [k]: v });
-  const audioLocked = !!mopts.audioExclEnd && !!endFrame?.url;
 
   const portrait = String(job.aspectRatio || "").startsWith("9:16")
     || (job.aspectRatio && /^(\d+):(\d+)$/.test(job.aspectRatio)
@@ -845,9 +824,9 @@ function PreviewModal({ job, projectName, models, fileNameBase, onClose, onDownl
     try {
       await onRevise(job.id, {
         overrides: {
-          modelId: f.modelId, speed: f.speed, resolution: f.resolution,
+          modelId: f.modelId, resolution: f.resolution,
           duration: f.duration, aspectRatio: f.aspectRatio,
-          generateAudio: mopts.audioForced ? false : (audioLocked ? false : f.generateAudio),
+          generateAudio: !!(mopts.audio && f.generateAudio),
         },
         prompt: f.prompt.trim(),
         // Chỉ gửi frame nếu model hỗ trợ; gửi null để xóa.
@@ -900,12 +879,6 @@ function PreviewModal({ job, projectName, models, fileNameBase, onClose, onDownl
                 </select>
               </div>
               <div>
-                <label>Speed</label>
-                <select value={f.speed} disabled={dis} onChange={(e) => setField("speed", e.target.value)}>
-                  {SPEEDS.map((x) => <option key={x} value={x}>{x}</option>)}
-                </select>
-              </div>
-              <div>
                 <label>Resolution</label>
                 <select value={f.resolution} disabled={dis} onChange={(e) => setField("resolution", e.target.value)}>
                   {mopts.resolution.map((x) => <option key={x} value={x}>{x}</option>)}
@@ -928,14 +901,12 @@ function PreviewModal({ job, projectName, models, fileNameBase, onClose, onDownl
                   {mopts.aspectRatio.map((x) => <option key={x} value={x}>{x}</option>)}
                 </select>
               </div>
-              {mopts.audioForced ? (
-                <div><label>Âm thanh</label><div className="muted" style={{ marginTop: 10, fontSize: 13 }}>Luôn bật</div></div>
-              ) : mopts.audio && (
+              {mopts.audio && (
                 <div>
                   <label>Generate audio</label>
-                  <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, cursor: dis || audioLocked ? "default" : "pointer" }}>
-                    <input type="checkbox" style={{ width: "auto" }} checked={!!f.generateAudio && !audioLocked}
-                      disabled={dis || audioLocked} onChange={(e) => setField("generateAudio", e.target.checked)} />
+                  <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, cursor: dis ? "default" : "pointer" }}>
+                    <input type="checkbox" style={{ width: "auto" }} checked={!!f.generateAudio}
+                      disabled={dis} onChange={(e) => setField("generateAudio", e.target.checked)} />
                     <span className="muted">Bật âm thanh</span>
                   </label>
                 </div>

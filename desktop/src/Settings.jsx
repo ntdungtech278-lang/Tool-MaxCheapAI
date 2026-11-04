@@ -8,22 +8,25 @@ const PROVIDERS = [
   { key: "claude", label: "Claude" },
 ];
 
-const DEFAULT_MAXCHEAP = {
-  apiKey: "", baseUrl: "https://maxcheapai.com/api", modelId: "veo-3.1",
-  speed: "normal", resolution: "720p", duration: 8, aspectRatio: "16:9", generateAudio: false,
+const DEFAULT_KLING = {
+  apiKey: "", secretKey: "", baseUrl: "https://api-singapore.klingai.com",
+  modelId: "kling-v2-6", resolution: "std(720p)", duration: 5, aspectRatio: "16:9",
+  generateAudio: false, negativePrompt: "", cfgScale: "",
 };
-
+// Vùng API Kling: tài khoản quốc tế (Singapore) và tài khoản Trung Quốc dùng host khác nhau.
+const KLING_REGIONS = [
+  { url: "https://api-singapore.klingai.com", label: "Quốc tế (Singapore)" },
+  { url: "https://api.klingai.com", label: "Trung Quốc (api.klingai.com)" },
+];
 // Đảm bảo mọi nhánh UI cần luôn tồn tại — tránh màn hình đen khi server/DB cũ
-// trả thiếu videoApi/veo3. Bổ khuyết chứ không ghi đè giá trị đã có.
+// trả thiếu videoApi. Bổ khuyết chứ không ghi đè giá trị đã có.
 function normalizeSettings(raw) {
   const s = { ...(raw || {}) };
   s.providers = s.providers || {};
-  s.veo3 = { model: "", geminiApiKey: "", hasKey: false, apiKeyMask: "", ...(s.veo3 || {}) };
   const va = s.videoApi || {};
   s.videoApi = {
-    activeProvider: va.activeProvider || "maxcheapai",
     concurrency: va.concurrency || 2,
-    providers: { ...(va.providers || {}), maxcheapai: { ...DEFAULT_MAXCHEAP, ...(va.providers?.maxcheapai || {}) } },
+    providers: { kling: { ...DEFAULT_KLING, ...(va.providers?.kling || {}) } },
   };
   s.sheetApi = { clientId: "", clientSecret: "", hasSecret: false, connected: false, connectedEmail: "", folderId: "", ...(s.sheetApi || {}) };
   return s;
@@ -49,9 +52,10 @@ export default function ApiConfig() {
 
   const setProvider = (key, field, value) =>
     setS({ ...s, providers: { ...s.providers, [key]: { ...s.providers[key], [field]: value } } });
+  // Sửa 1 field cấu hình Kling.
   const setVideo = (field, value) => {
-    const p = s.videoApi?.providers?.maxcheapai || {};
-    setS({ ...s, videoApi: { ...s.videoApi, providers: { ...s.videoApi?.providers, maxcheapai: { ...p, [field]: value } } } });
+    const p = s.videoApi?.providers?.kling || {};
+    setS({ ...s, videoApi: { ...s.videoApi, providers: { ...s.videoApi?.providers, kling: { ...p, [field]: value } } } });
   };
 
   // Tự test key khi rời ô/nhấn Enter: OK -> nạp list model; lỗi -> toast nổi.
@@ -75,10 +79,10 @@ export default function ApiConfig() {
       setProbing((m) => ({ ...m, [key]: false }));
     }
   }
-  const setVideoTop = (field, value) => setS({ ...s, videoApi: { ...s.videoApi, [field]: value } });
 
   const enabledKeys = PROVIDERS.filter((p) => s.providers[p.key]?.enabled).map((p) => p.key);
-  const vp = s.videoApi?.providers?.maxcheapai || {};
+  const vp = s.videoApi?.providers?.kling || {};
+  const secretPlaceholder = vp.hasSecretKey ? `Đã lưu: ${vp.secretKeyMask} — nhập để đổi` : "Nhập Secret Key";
 
   async function save() {
     setErr(""); setMsg("");
@@ -107,8 +111,12 @@ export default function ApiConfig() {
   }
   async function testVideo() {
     setVtest({ message: "Đang kiểm tra..." });
-    try { setVtest(await api.testVideoApi("maxcheapai")); }
-    catch (e) { setVtest({ ok: false, message: e.message }); }
+    try {
+      // Server test bằng key ĐÃ LƯU: lưu trước để key vừa nhập được kiểm tra (key để trống = giữ cái cũ).
+      const saved = await api.saveSettings(s);
+      if (saved && saved.providers) setS(normalizeSettings(saved));
+      setVtest(await api.testVideoApi());
+    } catch (e) { setVtest({ ok: false, message: e.message }); }
   }
 
   const keyPlaceholder = (prov) => (prov.hasKey ? `Đã lưu: ${prov.apiKeyMask} — nhập để đổi` : "Nhập API key");
@@ -212,32 +220,36 @@ export default function ApiConfig() {
         </div>
       </div>
 
-      {/* ---- API tạo video: MaxCheapAI ---- */}
+      {/* ---- API tạo video: Kling AI ---- */}
       <div className="card">
-        <h2 style={{ marginTop: 0 }}>API tạo video</h2>
-        <p className="muted">Cấu hình provider tạo video (dùng cho chức năng Tạo video).</p>
+        <h2 style={{ marginTop: 0 }}>API tạo video — Kling AI</h2>
+        <p className="muted">Access Key + Secret Key lấy ở Kling AI Console → API Keys. App tự ký token (JWT) cho mỗi request.</p>
         <div className="row">
           <div>
-            <label>Provider</label>
-            <select value={s.videoApi.activeProvider} onChange={(e) => setVideoTop("activeProvider", e.target.value)}>
-              <option value="maxcheapai">MaxCheapAI</option>
+            <label>Vùng API</label>
+            <select value={KLING_REGIONS.some((r) => r.url === vp.baseUrl) ? vp.baseUrl : ""}
+              onChange={(e) => e.target.value && setVideo("baseUrl", e.target.value)}>
+              {!KLING_REGIONS.some((r) => r.url === vp.baseUrl) && <option value="">Tùy chỉnh: {vp.baseUrl}</option>}
+              {KLING_REGIONS.map((r) => <option key={r.url} value={r.url}>{r.label}</option>)}
             </select>
-          </div>
-          <div>
-            <label>Base URL</label>
-            <input value={vp.baseUrl || ""} onChange={(e) => setVideo("baseUrl", e.target.value)}
-              placeholder="https://maxcheapai.com/api" />
           </div>
         </div>
         <div className="row" style={{ marginTop: 8 }}>
           <div>
-            <label>API Key</label>
+            <label>Access Key</label>
             <input type="password" value={vp.apiKey || ""} onChange={(e) => setVideo("apiKey", e.target.value)}
-              placeholder={keyPlaceholder(vp)} />
+              placeholder={keyPlaceholder(vp).replace("API key", "Access Key")} autoComplete="off" />
+          </div>
+          <div>
+            <label>Secret Key</label>
+            <input type="password" value={vp.secretKey || ""} onChange={(e) => setVideo("secretKey", e.target.value)}
+              placeholder={secretPlaceholder} autoComplete="off" />
           </div>
         </div>
-        <p className="muted" style={{ marginTop: 10, fontSize: 12 }}>
-          Model, speed, resolution, duration, aspect ratio, concurrency và generate audio nay được chọn ở tab <strong>Tạo video</strong>.
+        <p className="muted" style={{ marginTop: 8, fontSize: 12 }}>
+          Tài khoản quốc tế dùng vùng Singapore, tài khoản Trung Quốc dùng api.klingai.com — chọn sai vùng sẽ báo lỗi xác thực.
+          Kling tính credit theo gói, xem số dư trên console. Model, resolution, duration, aspect ratio, concurrency,
+          generate audio, negative prompt và CFG scale được chọn ở tab <strong>Tạo video</strong>.
         </p>
         <div className="toolbar" style={{ marginTop: 14, marginBottom: 0 }}>
           <button className="secondary" onClick={testVideo}>Test kết nối</button>
@@ -246,25 +258,6 @@ export default function ApiConfig() {
               {vtest.ok ? "OK" : "Lỗi"} {vtest.status != null ? `[${vtest.status}]` : ""} — {vtest.message}
             </span>
           )}
-        </div>
-      </div>
-
-      {/* Legacy Veo3 (Gemini) block kept for backward compat. */}
-      <div className="card">
-        <h2 style={{ marginTop: 0 }}>Model Veo3 (Gemini — tuỳ chọn)</h2>
-        <p className="muted">Cấu hình API Gemini để gọi tới Veo3 chính chủ (không bắt buộc).</p>
-        <div className="row">
-          <div>
-            <label>Gemini API Key</label>
-            <input type="password" value={s.veo3.geminiApiKey || ""}
-              onChange={(e) => setS({ ...s, veo3: { ...s.veo3, geminiApiKey: e.target.value } })}
-              placeholder={s.veo3.hasKey ? `Đã lưu: ${s.veo3.apiKeyMask} — nhập để đổi` : "Nhập API key"} />
-          </div>
-          <div>
-            <label>Veo3 Model ID</label>
-            <input value={s.veo3.model}
-              onChange={(e) => setS({ ...s, veo3: { ...s.veo3, model: e.target.value } })} />
-          </div>
         </div>
       </div>
 

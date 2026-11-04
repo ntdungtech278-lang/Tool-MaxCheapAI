@@ -1,5 +1,10 @@
 // kênh giao tiếp với backend
-const BASE = "http://localhost:4000/api";
+const ORIGIN = "http://localhost:4000";
+const BASE = `${ORIGIN}/api`;
+
+// Ảnh đầu/cuối do Kling lưu local ("/uploads/..."): thêm origin server để <img> xem được.
+// URL http(s)/data: giữ nguyên.
+export const assetUrl = (u) => (typeof u === "string" && u.startsWith("/uploads/") ? ORIGIN + u : u);
 
 let token = localStorage.getItem("token") || null;
 export const setToken = (t) => {
@@ -25,7 +30,6 @@ async function req(method, path, body) {
 export const api = {
   login: (username, password) => req("POST", "/login", { username, password }),
   me: () => req("GET", "/me"),
-  hp: () => req("GET", "/hp"),
   users: () => req("GET", "/users"),
   createUser: (u) => req("POST", "/users", u),
   updateUser: (id, u) => req("PUT", `/users/${id}`, u),
@@ -47,7 +51,7 @@ export const api = {
 
   // Test-connection (masked, no key returned).
   testModelPrompt: (provider, cfg) => req("POST", "/model-prompt/test", { provider, cfg }),
-  testVideoApi: (provider) => req("POST", "/video-api/test", { provider }),
+  testVideoApi: () => req("POST", "/video-api/test"),
 
   // Video projects (dự án riêng của module Tạo video).
   videoProjects: () => req("GET", "/video-projects"),

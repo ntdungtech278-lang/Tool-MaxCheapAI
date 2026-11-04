@@ -1,0 +1,16 @@
+{
+  "name": "generation-prompt",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tool tạo kịch bản prompt và video hàng loạt bằng Kling AI (Electron + Express + SQLite)",
+  "scripts": {
+    "setup": "npm install && npm install --prefix server && npm install --prefix desktop",
+    "dev": "concurrently -k -n server,vite,app -c blue,magenta,green \"npm run dev --prefix server\" \"npm run dev:vite --prefix desktop\" \"wait-on -t 60000 tcp:4000 tcp:5173 && cd desktop && node electron/launch.js\"",
+    "build": "npm run build --prefix desktop",
+    "test": "node server/src/videoValidate.js && node server/src/kling.js && node server/src/util.js"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1",
+    "wait-on": "^8.0.1"
+  }
+}

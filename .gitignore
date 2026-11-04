@@ -9,6 +9,9 @@ server/node_modules/
 *.db-wal
 *.db-shm
 
+# Ảnh đầu/cuối upload cho Kling (lưu local, đọc lại lúc submit)
+server/uploads/
+
 .env
 .env.*
 

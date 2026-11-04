@@ -136,13 +136,13 @@ const hasSettings = !!settingsRow;
 
 // Default video API config (added when missing so existing installs keep keys).
 const DEFAULT_VIDEO_API = {
-  activeProvider: "maxcheapai",
-  concurrency: 2,               // MaxCheapAI default video concurrent limit
+  concurrency: 2,               // số video chạy đồng thời mặc định (tuỳ gói Kling)
   providers: {
-    maxcheapai: {
-      apiKey: "", baseUrl: "https://maxcheapai.com/api",
-      modelId: "veo-3.1", speed: "normal", resolution: "720p",
-      duration: 8, aspectRatio: "16:9", generateAudio: false,
+    // Kling chính chủ: apiKey = Access Key, secretKey = Secret Key (ký JWT mỗi request).
+    kling: {
+      apiKey: "", secretKey: "", baseUrl: "https://api-singapore.klingai.com",
+      modelId: "kling-v2-6", resolution: "std(720p)", duration: 5, aspectRatio: "16:9",
+      generateAudio: false, negativePrompt: "", cfgScale: "",
     },
   },
 };
@@ -164,6 +164,15 @@ if (settingsRow) {
     }
   }
   if (!s.videoApi) { s.videoApi = DEFAULT_VIDEO_API; changed = true; }
+  if (!s.videoApi.providers) s.videoApi.providers = {};
+  // Bản cài cũ: bổ sung Kling (giữ key nếu đã có), rồi dọn dấu vết provider cũ đã gỡ
+  // (MaxCheapAI, Veo3/Gemini video, bảng giá HP). Key LLM/Google Sheet không đụng tới.
+  if (!s.videoApi.providers.kling) { s.videoApi.providers.kling = DEFAULT_VIDEO_API.providers.kling; changed = true; }
+  for (const legacy of ["maxcheapai"]) {
+    if (legacy in s.videoApi.providers) { delete s.videoApi.providers[legacy]; changed = true; }
+  }
+  for (const k of ["activeProvider"]) if (k in s.videoApi) { delete s.videoApi[k]; changed = true; }
+  for (const k of ["veo3", "hpPrices"]) if (k in s) { delete s[k]; changed = true; }
   if (changed) db.prepare("UPDATE settings SET value=? WHERE key='settings'").run(JSON.stringify(s));
 }
 
@@ -177,7 +186,6 @@ if (!hasSettings) {
         chatgpt:    { apiKey: "", model: "gpt-4o", baseUrl: "https://api.openai.com/v1", enabled: false },
         claude:     { apiKey: "", model: "claude-3-5-sonnet-20241022", enabled: false },
       },
-      veo3: { geminiApiKey: "", model: "veo-3.0-generate-preview" },
       videoApi: DEFAULT_VIDEO_API,
     })
   );

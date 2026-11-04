@@ -9,7 +9,7 @@
 
 const db = require("./db");
 const log = require("./log");
-const maxcheapai = require("./maxcheapai");
+const kling = require("./kling");
 const cfgSvc = require("./configService");
 const { validateVideoPayload } = require("./videoValidate");
 
@@ -19,7 +19,7 @@ const BACKOFF_BASE_MS = 5000;
 const JOB_TIMEOUT_MS = 10 * 60 * 1000; // cửa sổ poll TRỰC TIẾP. Hết hạn: KHÔNG hủy, chuyển 'stalled'
                                        // (giữ request_id), nhả slot; reconciler nền lo tiếp.
 const RECONCILE_MS = 30000;            // nhịp đối soát job 'stalled'/mồ côi với provider
-const MAX_AUTO_RETRY_3D = 3;           // Phòng 3D: fail -> tự tạo lại (đẩy đầu queue). Trần chặn đốt HP vô hạn.
+const MAX_AUTO_RETRY_3D = 3;           // Phòng 3D: fail -> tự tạo lại (đẩy đầu queue). Trần chặn tốn credit vô hạn.
 
 const runners = new Map();      // batchId -> { paused, cancelled }
 
@@ -131,16 +131,21 @@ function providerPayload(payload) {
   return p;
 }
 
+// Đọc key mới nhất từ settings mỗi lần gọi (admin có thể đổi key lúc job đang chạy).
+// `fallback` = cfg runner được giao lúc bắt đầu, dùng khi settings đọc không ra.
+const liveCfg = (fallback) => cfgSvc.getVideoApiConfig().cfg || fallback;
+
 async function submitVideoJob(cfg, job) {
-  const v = validateVideoPayload(job.provider, job.model_id, job.payload);
+  const v = validateVideoPayload(job.model_id, job.payload);
   if (!v.ok) { patchJob(job, { status: "failed", error_message: v.errors.join("; ") }); return; }
+  const c = liveCfg(cfg);
+  if (!kling.hasCreds(c)) {
+    patchJob(job, { status: "failed", error_message: `Thiếu ${kling.CREDS_HINT} trong Cấu hình API` });
+    return;
+  }
   patchJob(job, { status: "submitting" });
-  const resp = await maxcheapai.generateVideo(cfg, providerPayload(job.payload));
+  const resp = await kling.generateVideo(c, providerPayload(job.payload));
   patchJob(job, { status: "processing", request_id: String(resp.requestId ?? "") });
-  // Học giá HP thực (hpCost) theo combo model+setting -> lần sau ước tính trước khi bấm.
-  const p = job.payload || {};
-  cfgSvc.learnHpPrice({ modelId: p.modelId, resolution: p.resolution, duration: p.duration,
-    speed: p.speed, generateAudio: p.generateAudio }, resp.hpCost);
 }
 
 async function pollVideoJob(cfg, job, control) {
@@ -148,7 +153,7 @@ async function pollVideoJob(cfg, job, control) {
   while (!control.cancelled) {
     if (control.paused) { await sleep(1000); continue; }
     if (Date.now() > deadline) {
-      // KHÔNG tự hủy: request đã gửi (HP có thể đã trừ). Chuyển 'stalled' + giữ request_id,
+      // KHÔNG tự hủy: request đã gửi (credit có thể đã trừ). Chuyển 'stalled' + giữ request_id,
       // nhả slot cho job kế. Reconciler nền sẽ hỏi provider tới khi có kết quả CHẮC CHẮN.
       if (job.request_id) {
         patchJob(job, { status: "stalled",
@@ -161,7 +166,7 @@ async function pollVideoJob(cfg, job, control) {
     }
     await sleep(POLL_MS);
     let g;
-    try { g = await maxcheapai.getVideoGeneration(cfg, job.request_id); }
+    try { g = await kling.getVideoGeneration(liveCfg(cfg), job.request_id); }
     catch (e) {
       // 429 hoặc timeout mạng khi poll: bỏ qua vòng này, tiếp tục tới khi chạm deadline tổng.
       if (e.status === 429) { await sleep(BACKOFF_BASE_MS); continue; }
@@ -233,7 +238,7 @@ async function runQueue(cfg, concurrency, control) {
 }
 
 // Phòng 3D: 1 video fail -> tự tạo lại (bản mới cùng prompt/payload) và ĐẨY LÊN ĐẦU hàng đợi
-// để ưu tiên làm lại ngay. Trần MAX_AUTO_RETRY_3D chặn lặp vô hạn khi lỗi cố hữu (đốt HP).
+// để ưu tiên làm lại ngay. Trần MAX_AUTO_RETRY_3D chặn lặp vô hạn khi lỗi cố hữu (tốn credit).
 function maybeAutoRetry3d(control, job) {
   if (control.mode !== "3d" || control.cancelled || job.status !== "failed") return;
   const tried = job.autoRetry || 0;
@@ -274,12 +279,12 @@ function resumeBatch(batchId) { const c = runners.get(batchId); if (c) c.paused 
 function cancelBatch(batchId) {
   const c = runners.get(batchId); if (c) c.cancelled = true;
   const t = now();
-  // Job CHƯA gửi (không request_id): huỷ an toàn — chưa trừ HP.
+  // Job CHƯA gửi (không request_id): huỷ an toàn — chưa tốn credit.
   db.prepare(`UPDATE video_jobs SET status='failed', error_message='đã hủy', updated_at=?
     WHERE batch_id=? AND status IN ('queued','submitting','processing')
       AND (request_id='' OR request_id IS NULL)`).run(t, batchId);
-  // Job ĐÃ gửi (có request_id, HP có thể đã trừ): KHÔNG tự hủy — chuyển 'stalled' để đối soát,
-  // provider mới là nơi chốt kết quả & hoàn HP nếu lỗi.
+  // Job ĐÃ gửi (có request_id, credit có thể đã trừ): KHÔNG tự hủy — chuyển 'stalled' để đối soát,
+  // provider mới là nơi chốt kết quả & hoàn credit nếu lỗi.
   db.prepare(`UPDATE video_jobs SET status='stalled',
     error_message='Đã dừng theo dõi — đang đối soát với provider', updated_at=?
     WHERE batch_id=? AND status IN ('submitting','processing') AND request_id<>''`).run(t, batchId);
@@ -292,11 +297,15 @@ function getBatchJobs(batchId) {
 // ---- Reconciler: đối soát job 'stalled' với provider ----
 // Chỉ chốt job khi API trả kết quả CHẮC CHẮN (success | failed/error). Lỗi mạng/429/5xx
 // hoặc còn pending -> GIỮ NGUYÊN 'stalled', thử lại nhịp sau. Không bao giờ tự bịa lỗi/tự hủy.
-async function reconcileStalledJobs(cfg) {
-  const rows = db.prepare("SELECT * FROM video_jobs WHERE status='stalled' AND request_id<>''").all();
+async function reconcileStalledJobs() {
+  const rows = db.prepare("SELECT * FROM video_jobs WHERE status='stalled' AND request_id<>'' AND provider='kling'").all();
   for (const job of rows) {
     let g;
-    try { g = await maxcheapai.getVideoGeneration(cfg, job.request_id); }
+    try {
+      const c = liveCfg();
+      if (!kling.hasCreds(c)) continue; // chưa có key: để nguyên, thử lại sau
+      g = await kling.getVideoGeneration(c, job.request_id);
+    }
     catch { continue; } // mạng/429/timeout: chờ nhịp sau, không đổi trạng thái
     const st = String(g.status || "").toLowerCase();
     if (st === "success" || st === "succeeded" || st === "completed") {
@@ -310,11 +319,11 @@ async function reconcileStalledJobs(cfg) {
 }
 
 let reconcileTimer = null;
-// getCfg: hàm trả cfg mới nhất (apiKey có thể đổi lúc chạy). Chạy nền, không chặn thoát tiến trình.
-function startReconciler(getCfg) {
+// Cfg lấy theo provider của từng job (key có thể đổi lúc chạy). Chạy nền, không chặn thoát tiến trình.
+function startReconciler() {
   if (reconcileTimer) return;
   const tick = async () => {
-    try { const cfg = getCfg?.(); if (cfg?.apiKey) await reconcileStalledJobs(cfg); } catch {}
+    try { await reconcileStalledJobs(); } catch {}
   };
   reconcileTimer = setInterval(tick, RECONCILE_MS);
   reconcileTimer.unref?.();
@@ -322,10 +331,15 @@ function startReconciler(getCfg) {
 }
 
 // Gọi 1 lần khi server khởi động: runner in-memory đã chết sau restart.
-// - Đã submit (có request_id): chuyển 'stalled' -> reconciler lo, KHÔNG mất kết quả/HP.
-// - Chưa submit (không request_id): 'failed' (chưa trừ HP), user tạo lại được.
+// - Đã submit (có request_id): chuyển 'stalled' -> reconciler lo, KHÔNG mất kết quả/credit.
+// - Chưa submit (không request_id): 'failed' (chưa tốn credit), user tạo lại được.
 function recoverOrphansOnBoot() {
   const t = now();
+  // Job còn dang dở của provider cũ (đã gỡ khỏi tool): không còn client để đối soát -> chốt lỗi
+  // thay vì treo 'stalled' mãi. Video đã 'success' giữ nguyên (chỉ là URL, vẫn xem/tải được).
+  db.prepare(`UPDATE video_jobs SET status='failed',
+    error_message='Provider cũ đã được gỡ khỏi tool (chuyển sang Kling)', updated_at=?
+    WHERE status IN ('queued','submitting','processing','stalled') AND provider<>'kling'`).run(t);
   db.prepare(`UPDATE video_jobs SET status='stalled',
     error_message='Server khởi động lại — đang đối soát với provider', updated_at=?
     WHERE status IN ('submitting','processing') AND request_id<>''`).run(t);
